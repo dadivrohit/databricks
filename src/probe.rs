@@ -1,16 +1,15 @@
-//! Probe mode (PROBE=1): measures the scoring machine and prints a report to stderr,
-//! then exits with an error on purpose so the dev-set run returns the logs.
+//! Probe mode (PROBE=1): measures the scoring machine and prints a SHORT report to stderr
+//! (the platform only shows ~2 KB), then exits with an error on purpose so the dev run returns it.
 use crate::fast::*;
+use std::fmt::Write as _;
 use std::time::Instant;
 
 fn read(p: &str) -> String {
-    std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{e}>"))
+    std::fs::read_to_string(p).unwrap_or_default()
 }
-
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
-
 fn anon(bytes: usize, huge: bool) -> *mut u8 {
     unsafe {
         let p = libc::mmap(
@@ -28,7 +27,6 @@ fn anon(bytes: usize, huge: bool) -> *mut u8 {
         p as *mut u8
     }
 }
-
 fn touch(p: *mut u8, bytes: usize) {
     let mut i = 0;
     while i < bytes {
@@ -36,7 +34,6 @@ fn touch(p: *mut u8, bytes: usize) {
         i += 4096;
     }
 }
-
 fn par<F: Fn(usize) + Sync>(n: usize, f: F) -> f64 {
     let t = Instant::now();
     std::thread::scope(|s| {
@@ -48,140 +45,87 @@ fn par<F: Fn(usize) + Sync>(n: usize, f: F) -> f64 {
     ms(t)
 }
 
+/// Runs the pipeline as a child; returns "wall=start+parse+name+dedup+sess+write" in ms.
+fn pipeline(data: &str, out: &str, n: usize) -> String {
+    let t = Instant::now();
+    let r = std::process::Command::new("/proc/self/exe")
+        .env_remove("PROBE")
+        .env("TIMING", "1")
+        .env("NCPU", n.to_string())
+        .env("DATA_DIR", data)
+        .env("OUTPUT_DIR", out)
+        .output();
+    let el = ms(t);
+    let _ = std::fs::remove_dir_all(out);
+    let Ok(o) = r else { return "ERR".into() };
+    let err = String::from_utf8_lossy(&o.stderr);
+    let at = |name: &str| -> f64 {
+        err.lines()
+            .find(|l| l.contains(name))
+            .and_then(|l| l.split_whitespace().next())
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(-1.0)
+    };
+    let (m, p, nm, d, s, w) = (at("mmap"), at("parsed"), at("named"), at("dedup"), at("sessions"), at("written"));
+    format!("{el:.0}={m:.0}+{:.0}+{:.0}+{:.0}+{:.0}+{:.0}", p - m, nm - p, d - nm, s - d, w - s)
+}
+
 pub fn run() -> ! {
-    let t_all = Instant::now();
-    eprintln!("==== PROBE REPORT ====");
-    // ---- system
+    let mut r = String::new();
     let cpu = read("/proc/cpuinfo");
-    let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("");
-    let cache = cpu.lines().find(|l| l.starts_with("cache size")).unwrap_or("");
-    let mhz: Vec<&str> = cpu.lines().filter(|l| l.starts_with("cpu MHz")).collect();
-    eprintln!("cpu: {model} | {cache} | {} logical | mhz {:?}", mhz.len(), mhz.iter().take(2).collect::<Vec<_>>());
-    eprintln!("kernel: {}", read("/proc/version").trim());
-    eprintln!("thp enabled: {} | defrag: {}", read("/sys/kernel/mm/transparent_hugepage/enabled").trim(), read("/sys/kernel/mm/transparent_hugepage/defrag").trim());
-    eprintln!("affinity cpus: {:?}", std::thread::available_parallelism());
-    for f in ["/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/cpuset.cpus.effective", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"] {
-        eprintln!("{f}: {}", read(f).trim());
-    }
-    let mi = read("/proc/meminfo");
-    for l in mi.lines().take(6) {
-        eprintln!("meminfo {l}");
-    }
-    for l in read("/proc/self/mountinfo").lines() {
-        if l.contains(" /data ") || l.contains(" /output ") || l.contains(" /scratch ") || l.contains(" / ") || l.contains(" /tmp ") {
-            eprintln!("mount: {l}");
-        }
-    }
-    for k in ["NCPU", "MEM_GB", "DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR"] {
-        eprintln!("env {k}={:?}", std::env::var(k).ok());
-    }
+    let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").split(':').nth(1).unwrap_or("").trim().to_string();
+    let l3 = read("/sys/devices/system/cpu/cpu0/cache/index3/size");
+    let thp = read("/sys/kernel/mm/transparent_hugepage/enabled");
+    let thp = thp.split('[').nth(1).and_then(|x| x.split(']').next()).unwrap_or("?").to_string();
+    let rel = read("/proc/sys/kernel/osrelease");
+    let _ = writeln!(r, "P2 cpu={model} L3={} thp={thp} kern={}", l3.trim(), rel.trim());
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
     let scratch = std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into());
+
+    // 8x dataset from dev files (same IDs, so dedup removes 7/8; parse volume is realistic)
+    let big = format!("{scratch}/big");
+    let _ = std::fs::remove_dir_all(&big);
     let mut ev_files = Vec::new();
     for sub in ["events", "clicks", "links"] {
-        let mut total = 0u64;
-        let mut n = 0;
+        let _ = std::fs::create_dir_all(format!("{big}/{sub}"));
         if let Ok(rd) = std::fs::read_dir(format!("{data}/{sub}")) {
             for e in rd.flatten() {
-                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
-                total += len;
-                n += 1;
                 if sub == "events" {
                     ev_files.push(e.path());
                 }
-            }
-        }
-        eprintln!("data {sub}: {n} files, {total} bytes");
-    }
-
-    // ---- full pipeline, as subprocesses
-    let exe = "/proc/self/exe";
-    for (i, n) in [8usize, 8, 8, 4, 2, 1].iter().enumerate() {
-        let out = format!("{scratch}/probe_out_{i}");
-        let _ = std::fs::remove_dir_all(&out);
-        let t = Instant::now();
-        let r = std::process::Command::new(exe)
-            .env_remove("PROBE")
-            .env("TIMING", "1")
-            .env("NCPU", n.to_string())
-            .env("OUTPUT_DIR", &out)
-            .output();
-        let el = ms(t);
-        match r {
-            Ok(o) => {
-                let err = String::from_utf8_lossy(&o.stderr);
-                let phases: Vec<String> = err.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
-                eprintln!("pipeline NCPU={n}: wall {el:.1} ms, exit {:?} | {}", o.status.code(), phases.join(" | "));
-            }
-            Err(e) => eprintln!("pipeline NCPU={n}: spawn error {e}"),
-        }
-    }
-
-    // ---- an 8x bigger dataset made from the dev files (identical copies), for realistic parse volume
-    let big = format!("{scratch}/big");
-    let t = Instant::now();
-    let _ = std::fs::remove_dir_all(&big);
-    let mut ok = true;
-    for sub in ["events", "clicks", "links"] {
-        ok &= std::fs::create_dir_all(format!("{big}/{sub}")).is_ok();
-        if let Ok(rd) = std::fs::read_dir(format!("{data}/{sub}")) {
-            for e in rd.flatten() {
-                let reps = if sub == "links" { 1 } else { 8 };
-                for k in 0..reps {
-                    let dst = format!("{big}/{sub}/r{k}_{}", e.file_name().to_string_lossy());
-                    ok &= std::fs::copy(e.path(), dst).is_ok();
+                for k in 0..(if sub == "links" { 1 } else { 8 }) {
+                    let _ = std::fs::copy(e.path(), format!("{big}/{sub}/r{k}_{}", e.file_name().to_string_lossy()));
                 }
             }
         }
     }
     for f in ["products.csv", "campaigns.csv", "manifest.json"] {
-        ok &= std::fs::copy(format!("{data}/{f}"), format!("{big}/{f}")).is_ok();
+        let _ = std::fs::copy(format!("{data}/{f}"), format!("{big}/{f}"));
     }
-    eprintln!("built 8x dataset in {:.0} ms (ok={ok})", ms(t));
-    if ok {
-        for (i, n) in [8usize, 8, 8, 4, 1].iter().enumerate() {
-            let out = format!("{scratch}/probe_big_{i}");
-            let t = Instant::now();
-            let r = std::process::Command::new(exe)
-                .env_remove("PROBE")
-                .env("TIMING", "1")
-                .env("NCPU", n.to_string())
-                .env("DATA_DIR", &big)
-                .env("OUTPUT_DIR", &out)
-                .output();
-            let el = ms(t);
-            if let Ok(o) = r {
-                let err = String::from_utf8_lossy(&o.stderr);
-                let phases: Vec<String> = err.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
-                eprintln!("BIG pipeline NCPU={n}: wall {el:.1} ms, exit {:?} | {}", o.status.code(), phases.join(" | "));
-            }
-            let _ = std::fs::remove_dir_all(&out);
-        }
+    let _ = pipeline(&big, &format!("{scratch}/o"), 8); // warm the cache
+    let _ = write!(r, "BIG ms wall=start+parse+name+dedup+sess+write:");
+    for n in [8usize, 8, 4, 2, 1] {
+        let _ = write!(r, " n{n}:{}", pipeline(&big, &format!("{scratch}/o"), n));
     }
+    let _ = writeln!(r);
 
-    // ---- fresh memory cost
-    let mb = 512usize << 20;
-    for huge in [false, true] {
-        let p = anon(mb, huge);
-        let t = Instant::now();
-        touch(p, mb);
-        eprintln!("fresh-touch 512MB 1 thread huge={huge}: {:.1} ms", ms(t));
-        unsafe { libc::munmap(p as *mut _, mb) };
-    }
-    for huge in [false, true] {
-        let per = 128usize << 20;
-        let p = anon(per * 8, huge) as usize;
-        let el = par(8, |i| touch((p + i * per) as *mut u8, per));
-        eprintln!("fresh-touch 1GB 8 threads huge={huge}: {el:.1} ms");
-        let t = Instant::now();
-        unsafe { libc::munmap(p as *mut _, per * 8) };
-        eprintln!("munmap 1GB huge={huge}: {:.1} ms", ms(t));
-    }
-
-    // ---- memory bandwidth (prefaulted)
+    // fresh memory
     let gb = 1usize << 30;
+    let _ = write!(r, "fresh1GB 8thr ms:");
+    for huge in [false, true] {
+        let per = gb / 8;
+        let p = anon(gb, huge) as usize;
+        let el = par(8, |i| touch((p + i * per) as *mut u8, per));
+        let t = Instant::now();
+        unsafe { libc::munmap(p as *mut _, gb) };
+        let _ = write!(r, " huge={huge}:touch{el:.0}/unmap{:.0}", ms(t));
+    }
+    let _ = writeln!(r);
+
+    // bandwidth + random lookups
     let buf = anon(gb, true) as usize;
     touch(buf as *mut u8, gb);
+    let _ = write!(r, "readGB/s:");
     for n in [1usize, 4, 8] {
         let per = gb / n;
         let el = par(n, |i| {
@@ -192,7 +136,7 @@ pub fn run() -> ! {
             }
             std::hint::black_box(s);
         });
-        eprintln!("read-bandwidth {n} threads: {:.1} GB/s", gb as f64 / el / 1e6);
+        let _ = write!(r, " t{n}={:.1}", gb as f64 / el / 1e6);
     }
     let el = par(8, |i| unsafe {
         use std::arch::x86_64::*;
@@ -204,9 +148,9 @@ pub fn run() -> ! {
         }
         _mm_sfence();
     });
-    eprintln!("nt-write-bandwidth 8 threads: {:.1} GB/s", gb as f64 / el / 1e6);
-    // random 64B reads with prefetch, 32MB table (like person lookups)
-    for (tbl, n) in [(32usize << 20, 1usize), (32 << 20, 8), (8 << 20, 8), (256 << 20, 8)] {
+    let _ = writeln!(r, " ntwrite8={:.1}", gb as f64 / el / 1e6);
+    let _ = write!(r, "lookup ns(agg):");
+    for (tbl, n) in [(8usize << 20, 8usize), (32 << 20, 8), (256 << 20, 8), (32 << 20, 1)] {
         let lookups = 4_000_000usize;
         let el = par(n, |i| {
             let p = buf as *const u64;
@@ -214,10 +158,6 @@ pub fn run() -> ! {
             let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ i as u64;
             let mut s = 0u64;
             let mut idx = [0usize; 16];
-            for k in 0..16 {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                idx[k] = ((x >> 20) as usize & mask) * 8;
-            }
             for k in 0..lookups / n {
                 x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let nxt = ((x >> 20) as usize & mask) * 8;
@@ -229,31 +169,35 @@ pub fn run() -> ! {
             }
             std::hint::black_box(s);
         });
-        eprintln!("random-64B-lookups table {}MB {n} threads: {:.1} ns/lookup (aggregate)", tbl >> 20, el * 1e6 / lookups as f64);
+        let _ = write!(r, " {}MB/t{n}={:.1}", tbl >> 20, el * 1e6 / lookups as f64);
     }
+    let _ = writeln!(r);
 
-    // ---- reading input: pread copy vs mmap+populate
-    let total: usize = ev_files.iter().map(|p| std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0)).sum();
+    // input: pread copy vs mmap populate (8x event files, 8 threads)
+    let mut big_ev: Vec<std::path::PathBuf> =
+        std::fs::read_dir(format!("{big}/events")).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    big_ev.sort();
+    let total: usize = big_ev.iter().map(|p| std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0)).sum();
+    let _ = write!(r, "input8 GB/s:");
     for mode in 0..3 {
-        let files = &ev_files;
         let next = std::sync::atomic::AtomicUsize::new(0);
         let el = par(8, |_| {
             let mut b = vec![0u8; 256 << 10];
             loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(path) = files.get(i) else { break };
+                let Some(path) = big_ev.get(i) else { break };
                 let f = std::fs::File::open(path).unwrap();
                 let len = f.metadata().unwrap().len() as usize;
                 if mode == 0 {
                     use std::os::unix::fs::FileExt;
                     let mut off = 0;
                     while off < len {
-                        let r = f.read_at(&mut b, off as u64).unwrap();
-                        if r == 0 {
+                        let n = f.read_at(&mut b, off as u64).unwrap();
+                        if n == 0 {
                             break;
                         }
                         std::hint::black_box(b[0]);
-                        off += r;
+                        off += n;
                     }
                 } else if len > 0 {
                     use std::os::unix::io::AsRawFd;
@@ -273,22 +217,21 @@ pub fn run() -> ! {
                 }
             }
         });
-        let name = ["pread 256KB", "mmap+POPULATE_READ", "mmap+MAP_POPULATE"][mode];
-        eprintln!("input {name} 8 threads: {el:.1} ms for {total} bytes ({:.1} GB/s)", total as f64 / el / 1e6);
+        let _ = write!(r, " {}={:.1}", ["pread", "popread", "mappop"][mode], total as f64 / el / 1e6);
     }
+    let _ = writeln!(r);
 
-    // ---- parse throughput on in-memory event data
-    let mut blobs: Vec<Vec<u8>> = ev_files.iter().filter_map(|p| std::fs::read(p).ok()).collect();
-    blobs.retain(|b| b.len() > 1024);
+    // parse core (in memory)
+    let blobs: Vec<Vec<u8>> = ev_files.iter().filter_map(|p| std::fs::read(p).ok()).filter(|b| b.len() > 1024).collect();
     let cal = Calendar::new();
+    let _ = write!(r, "parse ns/line/thread:");
     for n in [1usize, 4, 8] {
         let lines = std::sync::atomic::AtomicUsize::new(0);
         let el = par(n, |_| {
             let mut sc = Scanner::new();
             let mut ts = Ts::new(&cal);
-            let mut acc = 0u64;
-            let mut cnt = 0usize;
-            for _rep in 0..3 {
+            let (mut acc, mut cnt) = (0u64, 0usize);
+            for _ in 0..3 {
                 for b in &blobs {
                     sc.scan::<7>(b, 0, b.len(), |p, f| unsafe {
                         let k = short_key(p.add(f[0].0), f[0].1 - f[0].0, b'e');
@@ -304,9 +247,9 @@ pub fn run() -> ! {
             lines.fetch_add(cnt, std::sync::atomic::Ordering::Relaxed);
         });
         let l = lines.load(std::sync::atomic::Ordering::Relaxed);
-        eprintln!("parse-core {n} threads: {:.1} ns/line per thread ({l} lines, {el:.0} ms)", el * 1e6 * n as f64 / l as f64);
+        let _ = write!(r, " t{n}={:.1}", el * 1e6 * n as f64 / l as f64);
     }
-    eprintln!("probe total {:.0} ms", ms(t_all));
-    eprintln!("==== END PROBE (failing on purpose to return these logs) ====");
+    let _ = writeln!(r, "\nEND");
+    eprint!("{r}");
     unsafe { libc::_exit(3) };
 }
