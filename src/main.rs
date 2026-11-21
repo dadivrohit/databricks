@@ -265,13 +265,40 @@ fn small_csv2(path: &Path, mut f: impl FnMut(&[u8], &[u8])) {
 struct Mapped {
     f: fs::File,
     len: usize,
+    map: *const u8, // null when not mapped
 }
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
 
 impl Mapped {
-    fn open(path: &Path) -> Mapped {
+    fn open(path: &Path, mapped: bool) -> Mapped {
+        use std::os::unix::io::AsRawFd;
         let f = fs::File::open(path).expect("open");
         let len = f.metadata().unwrap().len() as usize;
-        Mapped { f, len }
+        let mut map = std::ptr::null();
+        if mapped && len > 0 {
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+            if p != libc::MAP_FAILED {
+                map = p as *const u8;
+            }
+        }
+        Mapped { f, len, map }
+    }
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.map, self.len) }
+    }
+    /// Pre-load page tables for [start, end) (plus a tail) in one call.
+    fn populate(&self, start: usize, end: usize) {
+        let a = start & !4095;
+        let e = (end + 8192).min(self.len);
+        if e > a {
+            unsafe { libc::madvise(self.map.add(a) as *mut libc::c_void, e - a, 22 /* MADV_POPULATE_READ */) };
+        }
+    }
+    fn release(&self) {
+        if !self.map.is_null() {
+            unsafe { libc::munmap(self.map as *mut libc::c_void, self.len) };
+        }
     }
 }
 
@@ -579,10 +606,11 @@ fn main() {
     lap("lookups");
 
     // map files
+    let use_mmap = std::env::var("MMAP").is_ok();
     let mut files: Vec<(Mapped, u8)> = Vec::new();
     for (sub, kind) in [("events", 0u8), ("clicks", 1u8), ("links", 2u8)] {
         for p in csv_files(&data_dir.join(sub)) {
-            files.push((Mapped::open(&p), kind));
+            files.push((Mapped::open(&p, use_mmap && kind != 2), kind));
         }
     }
     let mut chunks = Vec::new();
@@ -607,7 +635,7 @@ fn main() {
     struct Parsed {
         _arena: Arena,
         ev: Parts<EventRec>,
-        cl: Vec<ClickRaw>,
+        cl: Parts<ClickRaw>,
     }
     let arena_cap = (total_event_bytes / nthreads) * 2 + (512 << 20);
     let parsed: Vec<Parsed> = std::thread::scope(|s| {
@@ -617,10 +645,9 @@ fn main() {
                 let (chunks, files, next, cal, campaigns, products, ekeys, ckeys, t0) =
                     (&chunks, &files, &next, &cal, &campaigns, &products, &ekeys, &ckeys, &t0);
                 s.spawn(move || {
-                    // ---- links: insert keys, union, name each person
+                    // ---- links: insert keys and union them right away (lock-free); naming happens after parsing
                     let mut sc = Scanner::new();
                     let mut rd = ChunkReader::new();
-                    let mut edges: Vec<(u32, u32)> = Vec::new();
                     let mut kpairs: Vec<(u64, u64)> = Vec::new();
                     loop {
                         let i = next_link.fetch_add(1, Ordering::Relaxed);
@@ -644,73 +671,26 @@ fn main() {
                                 lt.prefetch(kpairs[i + 12].1);
                             }
                             let (ka, kb) = kpairs[i];
-                            edges.push((lt.insert(ka), lt.insert(kb)));
+                            lt.union(lt.insert(ka), lt.insert(kb));
                         }
                         kpairs.clear();
                     }
-                    barrier.wait();
-                    for &(a, b) in &edges {
-                        lt.union(a, b);
-                    }
-                    drop(edges);
-                    barrier.wait();
-                    let cap = lt.mask + 1;
-                    let (r0, r1) = (cap * tid / nthreads, cap * (tid + 1) / nthreads);
-                    let mut exo = Vec::new();
-                    for slot in r0..r1 {
-                        let k = lt.slots[slot][0].load(Ordering::Relaxed);
-                        if k == 0 {
-                            continue;
-                        }
-                        if k & EXOTIC != 0 {
-                            exo.push(slot as u32);
-                        } else {
-                            let r = lt.find(slot as u32) as usize;
-                            lt.slots[r][1].fetch_max(!k, Ordering::Relaxed);
-                        }
-                    }
-                    if !exo.is_empty() {
-                        exotic_slots.lock().unwrap().extend(exo);
-                    }
-                    barrier.wait();
-                    if tid == 0 {
-                        let ex = std::mem::take(&mut *exotic_slots.lock().unwrap());
-                        if !ex.is_empty() {
-                            let uk = Keys { prefix: b'u', exotic: users.snapshot() };
-                            for slot in ex {
-                                let k = lt.slots[slot as usize][0].load(Ordering::Relaxed);
-                                let r = lt.find(slot) as usize;
-                                let cur = !lt.slots[r][1].load(Ordering::Relaxed);
-                                if cur == u64::MAX || uk.cmp(k, cur) == std::cmp::Ordering::Less {
-                                    lt.slots[r][1].store(!k, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                    barrier.wait();
-                    for slot in r0..r1 {
-                        if lt.slots[slot][0].load(Ordering::Relaxed) == 0 {
-                            continue;
-                        }
-                        let r = lt.find(slot as u32) as usize;
-                        if r != slot {
-                            let name = lt.slots[r][1].load(Ordering::Relaxed);
-                            lt.slots[slot][1].store(name, Ordering::Relaxed);
-                        }
-                    }
-                    barrier.wait();
-                    if timing && tid == 0 {
-                        eprintln!("{:>8.1} ms  links done (thread 0)", t0.elapsed().as_secs_f64() * 1e3);
-                    }
+                    let _ = (barrier, exotic_slots, tid);
                     let mut arena = Arena::new(arena_cap);
                     let mut ev: WcParts<EventRec> = WcParts::new(NP);
-                    let mut cl: Vec<ClickRaw> = Vec::new();
+                    let mut cl: Parts<ClickRaw> = Parts::new(1, fast::BLOCK_BYTES / std::mem::size_of::<ClickRaw>());
                     let mut ts = Ts::new(cal);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(c) = chunks.get(i) else { break };
-                        let (cs, ce) = rd.load(&files[c.file as usize].0, c.start, c.end);
-                        let data = rd.data();
+                        let m = &files[c.file as usize].0;
+                        let (data, cs, ce) = if m.map.is_null() {
+                            let (cs, ce) = rd.load(m, c.start, c.end);
+                            (rd.data(), cs, ce)
+                        } else {
+                            m.populate(c.start, c.end);
+                            (m.bytes(), c.start, c.end)
+                        };
                         match c.kind {
                             2 => unreachable!(),
                             1 => {
@@ -729,7 +709,7 @@ fn main() {
                                     };
                                     let ckey = key_of(p.add(fc.0), fc.1 - fc.0, b'k', &ckeys);
                                     let ukey = key_of(p.add(fu.0), fu.1 - fu.0, b'u', users);
-                                    cl.push(ClickRaw { ukey, ckey, ts: (t - ws) as i32, camp });
+                                    cl.push(&mut arena, 0, ClickRaw { ukey, ckey, ts: (t - ws) as i32, camp });
                                 });
                             }
                             _ => {
@@ -796,15 +776,69 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     lap("parsed (+union-find)");
+    // ---- name each person (smallest ID) and point every linked ID at that name
+    std::thread::scope(|s| {
+        for tid in 0..nthreads {
+            let (lt, barrier, exotic_slots, users) = (&lt, &barrier, &exotic_slots, &users);
+            s.spawn(move || {
+                let cap = lt.mask + 1;
+                let (r0, r1) = (cap * tid / nthreads, cap * (tid + 1) / nthreads);
+                let mut exo = Vec::new();
+                for slot in r0..r1 {
+                    let k = lt.slots[slot][0].load(Ordering::Relaxed);
+                    if k == 0 {
+                        continue;
+                    }
+                    if k & EXOTIC != 0 {
+                        exo.push(slot as u32);
+                    } else {
+                        let r = lt.find(slot as u32) as usize;
+                        lt.slots[r][1].fetch_max(!k, Ordering::Relaxed);
+                    }
+                }
+                if !exo.is_empty() {
+                    exotic_slots.lock().unwrap().extend(exo);
+                }
+                barrier.wait();
+                if tid == 0 {
+                    let ex = std::mem::take(&mut *exotic_slots.lock().unwrap());
+                    if !ex.is_empty() {
+                        let uk = Keys { prefix: b'u', exotic: users.snapshot() };
+                        for slot in ex {
+                            let k = lt.slots[slot as usize][0].load(Ordering::Relaxed);
+                            let r = lt.find(slot) as usize;
+                            let cur = !lt.slots[r][1].load(Ordering::Relaxed);
+                            if cur == u64::MAX || uk.cmp(k, cur) == std::cmp::Ordering::Less {
+                                lt.slots[r][1].store(!k, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                barrier.wait();
+                for slot in r0..r1 {
+                    if lt.slots[slot][0].load(Ordering::Relaxed) == 0 {
+                        continue;
+                    }
+                    let r = lt.find(slot as u32) as usize;
+                    if r != slot {
+                        let name = lt.slots[r][1].load(Ordering::Relaxed);
+                        lt.slots[slot][1].store(name, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    lap("named");
 
     // ---- dedup events per partition; route survivors and clicks to person buckets
+    // each piece: 64 click blocks of one thread
     let click_pieces: Vec<(usize, usize, usize)> = {
         let mut v = Vec::new();
         for (t, p) in parsed.iter().enumerate() {
-            let n = p.cl.len();
+            let n = p.cl.block_ptrs(0).len();
             let mut s = 0;
             while s < n {
-                let e = (s + 65536).min(n);
+                let e = (s + 64).min(n);
                 v.push((t, s, e));
                 s = e;
             }
@@ -832,9 +866,10 @@ fn main() {
                     let mut surv: Vec<u32> = Vec::new();
                     loop {
                         let w = next.fetch_add(1, Ordering::Relaxed);
-                        if w < click_pieces.len() {
-                            let (t, a, b) = click_pieces[w];
-                            let src = &parsed[t].cl[a..b];
+                        // event partitions first (they free blocks), then click pieces (which reuse them)
+                        if w >= NP && w - NP < click_pieces.len() {
+                            let (t, a, b) = click_pieces[w - NP];
+                            for src in parsed[t].cl.slices(0).skip(a).take(b - a) {
                             for (i, c) in src.iter().enumerate() {
                                 if i + 16 < src.len() {
                                     lt.prefetch(src[i + 16].ukey);
@@ -842,12 +877,13 @@ fn main() {
                                 let person = lt.get(c.ukey).unwrap_or(c.ukey);
                                 outc.push_r(&mut arena, &mut free, pbucket(person), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                             }
+                            }
                             continue;
                         }
-                        let p = w - click_pieces.len();
-                        if p >= NP {
+                        if w >= NP {
                             break;
                         }
+                        let p = w;
                         buf.clear();
                         for t in &parsed {
                             for sl in t.ev.slices(p) {
@@ -1129,6 +1165,16 @@ fn main() {
         for a in parsed.iter().map(|p| &p._arena).chain(routed.iter().map(|r| &r._arena)) {
             s.spawn(move || a.release());
         }
+        let files = &files;
+        for t in 0..nthreads {
+            s.spawn(move || {
+                for (i, f) in files.iter().enumerate() {
+                    if i % nthreads == t {
+                        f.0.release();
+                    }
+                }
+            });
+        }
         for (ti, o) in results.iter().enumerate() {
             let ukeys = &ukeys;
             let cats = &cats;
@@ -1181,8 +1227,7 @@ fn main() {
                     },
                     Column { name: "top_category", values: Values::Bytes(top), defined: Some(defined), logical: Logical::String },
                 ];
-                let bytes = parquet::encode(&cols, n);
-                fs::write(ud_dir.join(format!("part-{ti}.parquet")), bytes).unwrap();
+                parquet::write_file(&ud_dir.join(format!("part-{ti}.parquet")), &cols, n).unwrap();
             });
         }
         let mut agg = vec![[0i64; 4]; ncols * ndays]; // [campaign * ndays + day]
@@ -1233,7 +1278,7 @@ fn main() {
             Column { name: "revenue_cents", values: Values::I64(s2), defined: None, logical: Logical::None },
             Column { name: "assisted_sessions", values: Values::I64(s3), defined: None, logical: Logical::None },
         ];
-        fs::write(cd_dir.join("part-0.parquet"), parquet::encode(&cols, n)).unwrap();
+        parquet::write_file(&cd_dir.join("part-0.parquet"), &cols, n).unwrap();
     });
     lap("written");
     unsafe { libc::_exit(0) };

@@ -106,6 +106,62 @@ fn physical(v: &Values) -> i32 {
     }
 }
 
+fn value_bytes(v: &Values) -> &[u8] {
+    // little-endian target: the in-memory layout is the PLAIN encoding
+    match v {
+        Values::I32(x) => unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) },
+        Values::I64(x) => unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 8) },
+        Values::Bytes(b) => b,
+    }
+}
+
+/// Writes the file straight to disk, column by column, without assembling it in memory.
+pub fn write_file(path: &std::path::Path, columns: &[Column], rows: usize) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    let mut pos = 4usize;
+    f.write_all(b"PAR1")?;
+    let mut metas = Vec::new();
+    for c in columns {
+        let mut levels: Vec<u8> = Vec::new();
+        if let Some(bits) = &c.defined {
+            let groups = rows.div_ceil(8);
+            let mut run = Vec::with_capacity(groups + 10);
+            let mut v = ((groups as u64) << 1) | 1;
+            while v >= 0x80 {
+                run.push((v as u8) | 0x80);
+                v >>= 7;
+            }
+            run.push(v as u8);
+            run.extend_from_slice(&bits[..groups]);
+            levels.extend_from_slice(&(run.len() as u32).to_le_bytes());
+            levels.extend_from_slice(&run);
+        }
+        let data = value_bytes(&c.values);
+        let page_len = levels.len() + data.len();
+        let mut h = Thrift::new();
+        h.i32f(1, 0);
+        h.i32f(2, page_len as i32);
+        h.i32f(3, page_len as i32);
+        h.struct_begin_field(5);
+        h.i32f(1, rows as i32);
+        h.i32f(2, 0);
+        h.i32f(3, 3);
+        h.i32f(4, 3);
+        h.struct_end();
+        h.out.push(0);
+        let offset = pos;
+        h.out.extend_from_slice(&levels);
+        f.write_all(&h.out)?;
+        f.write_all(data)?;
+        pos += h.out.len() + data.len();
+        metas.push((offset, pos - offset));
+    }
+    let footer = footer(columns, rows, &metas);
+    f.write_all(&footer)?;
+    Ok(())
+}
+
 /// Encodes the file. `rows` is the row count of every column.
 pub fn encode(columns: &[Column], rows: usize) -> Vec<u8> {
     let mut size_hint = 64;
@@ -171,7 +227,11 @@ pub fn encode(columns: &[Column], rows: usize) -> Vec<u8> {
         }
         metas.push((offset, out.len() - offset));
     }
-    // FileMetaData
+    out.extend_from_slice(&footer(columns, rows, &metas));
+    out
+}
+
+fn footer(columns: &[Column], rows: usize, metas: &[(usize, usize)]) -> Vec<u8> {
     let mut t = Thrift::new();
     t.i32f(1, 1);
     t.list(2, T_STRUCT, columns.len() + 1);
@@ -208,7 +268,7 @@ pub fn encode(columns: &[Column], rows: usize) -> Vec<u8> {
     t.struct_begin(); // RowGroup
     t.list(1, T_STRUCT, columns.len());
     let mut total = 0i64;
-    for (c, &(offset, size)) in columns.iter().zip(&metas) {
+    for (c, &(offset, size)) in columns.iter().zip(metas) {
         total += size as i64;
         t.struct_begin(); // ColumnChunk
         t.i64f(2, offset as i64);
@@ -233,8 +293,9 @@ pub fn encode(columns: &[Column], rows: usize) -> Vec<u8> {
     t.struct_end(); // RowGroup
     t.binf(6, b"shopping-sessions");
     t.out.push(0);
-    out.extend_from_slice(&t.out);
-    out.extend_from_slice(&(t.out.len() as u32).to_le_bytes());
+    let mut out = t.out;
+    let n = out.len() as u32;
+    out.extend_from_slice(&n.to_le_bytes());
     out.extend_from_slice(b"PAR1");
     out
 }
