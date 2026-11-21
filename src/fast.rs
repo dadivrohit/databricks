@@ -588,6 +588,10 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
+    /// Unmaps the whole arena (call once nothing reads it any more).
+    pub fn release(&self) {
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.cap) };
+    }
     pub fn new(cap: usize) -> Self {
         let p = unsafe {
             libc::mmap(

@@ -229,6 +229,20 @@ impl Lookup {
     }
 }
 
+/// (offset, line) for every line (a trailing newline does not start a line).
+fn line_slices(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if pos >= data.len() {
+            return None;
+        }
+        let e = memchr::memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
+        let r = (pos, &data[pos..e]);
+        pos = e + 1;
+        Some(r)
+    })
+}
+
 /// Rows of a small 2-column CSV (header skipped, malformed dropped).
 fn small_csv2(path: &Path, mut f: impl FnMut(&[u8], &[u8])) {
     let data = fs::read(path).unwrap_or_default();
@@ -506,15 +520,29 @@ fn main() {
     let ndays = ((we - 1).div_euclid(DAY) - first_day + 1).max(1) as usize;
     let ws_s = ws.div_euclid(1000);
 
-    // products & categories
-    let mut prod_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    small_csv2(&data_dir.join("products.csv"), |a, b| prod_rows.push((a.to_vec(), b.to_vec())));
+    // products & categories (allocation-free per row)
+    let prod_data = fs::read(data_dir.join("products.csv")).unwrap_or_default();
+    let mut prod_rows: Vec<((usize, usize), (usize, usize))> = Vec::with_capacity(prod_data.len() / 16);
+    {
+        let mut fl = [(0usize, 0usize); 2];
+        let mut first = true;
+        for (off, line) in line_slices(&prod_data) {
+            if first {
+                first = false;
+                continue;
+            }
+            if fast::split::<2>(line, &mut fl) {
+                prod_rows.push(((off + fl[0].0, off + fl[0].1), (off + fl[1].0, off + fl[1].1)));
+            }
+        }
+    }
+    let pslice = |r: (usize, usize)| &prod_data[r.0..r.1];
     let mut cats: Vec<Vec<u8>> = Vec::new();
     {
         let mut seen: HashMap<&[u8], ()> = HashMap::new();
-        for (_, c) in &prod_rows {
-            if seen.insert(c.as_slice(), ()).is_none() {
-                cats.push(c.clone());
+        for &(_, c) in &prod_rows {
+            if seen.insert(pslice(c), ()).is_none() {
+                cats.push(pslice(c).to_vec());
             }
         }
     }
@@ -526,17 +554,18 @@ fn main() {
     let unknown_cat = cat_id(b"unknown");
     let mut products = Lookup::new(b"p");
     {
-        let mut cache: HashMap<Vec<u8>, u32> = HashMap::new();
-        for (p, c) in &prod_rows {
-            let id = match cache.get(c) {
-                Some(&i) => i,
-                None => {
-                    let i = cat_id(c);
-                    cache.insert(c.clone(), i);
-                    i
-                }
+        let mut last: (&[u8], u32) = (&[], 0);
+        let mut cache: HashMap<&[u8], u32> = HashMap::new();
+        for &(pr, c) in &prod_rows {
+            let cs = pslice(c);
+            let id = if cs == last.0 {
+                last.1
+            } else {
+                let i = *cache.entry(cs).or_insert_with(|| cat_id(cs));
+                last = (cs, i);
+                i
             };
-            products.insert(p, id);
+            products.insert(pslice(pr), id);
         }
     }
     // campaigns
@@ -889,17 +918,22 @@ fn main() {
 
     // ---- sessions & attribution per person bucket
     let ckeys_k = Keys { prefix: b'k', exotic: ckeys.snapshot() };
+    // biggest buckets first, so a whale or shared-device person never runs last
+    let mut order: Vec<(usize, usize)> = (0..NQ).map(|q| (routed.iter().map(|t| t.ev.len(q)).sum(), q)).collect();
+    order.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let order = &order;
     let next = AtomicUsize::new(0);
     struct Out {
         rows: Vec<UserRow>,
-        camp: Vec<[i64; 4]>,
+        camp: Vec<[i64; 3]>, // [day * ncols + campaign]: sessions, purchasing, revenue
+        assist: Vec<u32>,    // [day * ncols + campaign]
     }
     let ncols = ncamp + 1; // last = organic
     let results: Vec<Out> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
                 s.spawn(|| {
-                    let mut o = Out { rows: Vec::new(), camp: vec![[0; 4]; ncols * ndays] };
+                    let mut o = Out { rows: Vec::new(), camp: vec![[0; 3]; ncols * ndays], assist: vec![0; ncols * ndays] };
                     let mut evs: Vec<(u64, u32, u32)> = Vec::new(); // (idx<<32|ts, price, cat)
                     let mut cls: Vec<(u64, u64, u32)> = Vec::new(); // (idx<<32|ts', ckey, camp)
                     let mut pkeys: Vec<u64> = Vec::new();
@@ -909,11 +943,11 @@ fn main() {
                     let mut pos: Vec<u32> = vec![0; ncamp];
                     let mut catsum: Vec<(u32, i64)> = Vec::new();
                     loop {
-                        let q = next.fetch_add(1, Ordering::Relaxed);
-                        if q >= NQ {
+                        let qi = next.fetch_add(1, Ordering::Relaxed);
+                        if qi >= NQ {
                             break;
                         }
-                        let n: usize = routed.iter().map(|t| t.ev.len(q)).sum();
+                        let (n, q) = order[qi];
                         if n == 0 {
                             continue;
                         }
@@ -1057,12 +1091,13 @@ fn main() {
                                 } else {
                                     ncamp
                                 };
-                                let cell = &mut o.camp[credited * ndays + dayu];
+                                let cell = &mut o.camp[dayu * ncols + credited];
                                 cell[0] += 1;
                                 cell[1] += purchases as i64;
                                 cell[2] += rev;
+                                let arow = &mut o.assist[dayu * ncols..(dayu + 1) * ncols];
                                 for &a in &active {
-                                    o.camp[a as usize * ndays + dayu][3] += 1;
+                                    unsafe { *arow.get_unchecked_mut(a as usize) += 1 };
                                 }
                                 k = m;
                             }
@@ -1091,6 +1126,9 @@ fn main() {
     fs::create_dir_all(&ud_dir).unwrap();
     fs::create_dir_all(&cd_dir).unwrap();
     std::thread::scope(|s| {
+        for a in parsed.iter().map(|p| &p._arena).chain(routed.iter().map(|r| &r._arena)) {
+            s.spawn(move || a.release());
+        }
         for (ti, o) in results.iter().enumerate() {
             let ukeys = &ukeys;
             let cats = &cats;
@@ -1147,11 +1185,16 @@ fn main() {
                 fs::write(ud_dir.join(format!("part-{ti}.parquet")), bytes).unwrap();
             });
         }
-        let mut agg = vec![[0i64; 4]; ncols * ndays];
+        let mut agg = vec![[0i64; 4]; ncols * ndays]; // [campaign * ndays + day]
         for o in &results {
-            for (a, b) in agg.iter_mut().zip(&o.camp) {
-                for x in 0..4 {
-                    a[x] += b[x];
+            for d in 0..ndays {
+                for c in 0..ncols {
+                    let b = o.camp[d * ncols + c];
+                    let a = &mut agg[c * ndays + d];
+                    a[0] += b[0];
+                    a[1] += b[1];
+                    a[2] += b[2];
+                    a[3] += o.assist[d * ncols + c] as i64;
                 }
             }
         }
