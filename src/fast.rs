@@ -601,6 +601,14 @@ impl Arena {
         };
         assert!(p != libc::MAP_FAILED, "arena mmap failed");
         unsafe { libc::madvise(p, cap, libc::MADV_HUGEPAGE) };
+        if std::env::var("PREFAULT").is_ok() {
+            let touch = cap.min(1 << 30);
+            let mut i = 0;
+            while i < touch {
+                unsafe { *(p as *mut u8).add(i) = 0 };
+                i += 4096;
+            }
+        }
         Arena { base: p as *mut u8, cap, used: 0 }
     }
     #[inline(always)]
