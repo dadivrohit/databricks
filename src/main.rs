@@ -2,6 +2,7 @@
 mod fast;
 mod links;
 mod parquet;
+mod probe;
 
 use fast::*;
 use std::collections::HashMap;
@@ -511,6 +512,9 @@ fn env(name: &str, default: &str) -> String {
 }
 
 fn main() {
+    if std::env::var("PROBE").is_ok() {
+        probe::run();
+    }
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = PathBuf::from(if args.len() >= 3 { args[1].clone() } else { env("DATA_DIR", "/data") });
