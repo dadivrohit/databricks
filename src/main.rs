@@ -592,6 +592,7 @@ fn main() {
                     let mut sc = Scanner::new();
                     let mut rd = ChunkReader::new();
                     let mut edges: Vec<(u32, u32)> = Vec::new();
+                    let mut kpairs: Vec<(u64, u64)> = Vec::new();
                     loop {
                         let i = next_link.fetch_add(1, Ordering::Relaxed);
                         if i >= nlink_chunks {
@@ -606,8 +607,17 @@ fn main() {
                             }
                             let ka = key_of(p.add(a.0), a.1 - a.0, b'u', users);
                             let kb = key_of(p.add(b.0), b.1 - b.0, b'u', users);
-                            edges.push((lt.insert(ka), lt.insert(kb)));
+                            kpairs.push((ka, kb));
                         });
+                        for i in 0..kpairs.len() {
+                            if i + 12 < kpairs.len() {
+                                lt.prefetch(kpairs[i + 12].0);
+                                lt.prefetch(kpairs[i + 12].1);
+                            }
+                            let (ka, kb) = kpairs[i];
+                            edges.push((lt.insert(ka), lt.insert(kb)));
+                        }
+                        kpairs.clear();
                     }
                     barrier.wait();
                     for &(a, b) in &edges {
@@ -659,11 +669,12 @@ fn main() {
                             lt.slots[slot][1].store(name, Ordering::Relaxed);
                         }
                     }
+                    barrier.wait();
                     if timing && tid == 0 {
                         eprintln!("{:>8.1} ms  links done (thread 0)", t0.elapsed().as_secs_f64() * 1e3);
                     }
                     let mut arena = Arena::new(arena_cap);
-                    let mut ev: Parts<EventRec> = Parts::new(NP, 256);
+                    let mut ev: WcParts<EventRec> = WcParts::new(NP);
                     let mut cl: Vec<ClickRaw> = Vec::new();
                     let mut ts = Ts::new(cal);
                     loop {
@@ -688,7 +699,7 @@ fn main() {
                                         return;
                                     };
                                     let ckey = key_of(p.add(fc.0), fc.1 - fc.0, b'k', &ckeys);
-                                    let ukey = key_of(p.add(fu.0), fu.1 - fu.0, b'u', &users);
+                                    let ukey = key_of(p.add(fu.0), fu.1 - fu.0, b'u', users);
                                     cl.push(ClickRaw { ukey, ckey, ts: (t - ws) as i32, camp });
                                 });
                             }
@@ -704,7 +715,7 @@ fn main() {
                                     let ingest = (ingest_s - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                                     let f1 = f[1];
                                     let mut valid = f1.0 != f1.1;
-                                    let ukey = if valid { key_of(p.add(f1.0), f1.1 - f1.0, b'u', &users) } else { 0 };
+                                    let ukey = if valid { key_of(p.add(f1.0), f1.1 - f1.0, b'u', users) } else { 0 };
                                     let f2 = f[2];
                                     let mut tsr = 0u32;
                                     match ts.ms(p.add(f2.0), f2.1 - f2.0) {
@@ -748,13 +759,13 @@ fn main() {
                             }
                         }
                     }
-                    Parsed { _arena: arena, ev, cl }
+                    ev.finish(&mut arena);
+                    Parsed { _arena: arena, ev: ev.parts, cl }
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let lmap = &lt;
     lap("parsed (+union-find)");
 
     // ---- dedup events per partition; route survivors and clicks to person buckets
@@ -783,8 +794,9 @@ fn main() {
             .map(|_| {
                 s.spawn(|| {
                     let mut arena = Arena::new(route_cap);
-                    let mut out: Parts<PEv> = Parts::new(NQ, 256);
-                    let mut outc: Parts<ClickRec> = Parts::new(NQ, 128);
+                    let mut out: WcParts<PEv> = WcParts::new(NQ);
+                    let mut outc: Parts<ClickRec> = Parts::new(NQ, fast::BLOCK_BYTES / std::mem::size_of::<ClickRec>());
+                    let mut free: Vec<*mut u8> = Vec::new();
                     let mut buf: Vec<EventRec> = Vec::new();
                     let mut table: Vec<u32> = Vec::new();
                     let mut win: Vec<bool> = Vec::new();
@@ -796,10 +808,10 @@ fn main() {
                             let src = &parsed[t].cl[a..b];
                             for (i, c) in src.iter().enumerate() {
                                 if i + 16 < src.len() {
-                                    lmap.prefetch(src[i + 16].ukey);
+                                    lt.prefetch(src[i + 16].ukey);
                                 }
-                                let person = lmap.get(c.ukey).unwrap_or(c.ukey);
-                                outc.push(&mut arena, pbucket(person), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
+                                let person = lt.get(c.ukey).unwrap_or(c.ukey);
+                                outc.push_r(&mut arena, &mut free, pbucket(person), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                             }
                             continue;
                         }
@@ -812,6 +824,7 @@ fn main() {
                             for sl in t.ev.slices(p) {
                                 buf.extend_from_slice(sl);
                             }
+                            free.extend(t.ev.block_ptrs(p).iter().map(|&b| b as *mut u8));
                         }
                         let n = buf.len();
                         if n == 0 {
@@ -853,18 +866,20 @@ fn main() {
                         }
                         for (x, &i) in surv.iter().enumerate() {
                             if x + 16 < surv.len() {
-                                lmap.prefetch(buf[surv[x + 16] as usize].ukey);
+                                lt.prefetch(buf[surv[x + 16] as usize].ukey);
                             }
                             let r = &buf[i as usize];
-                            let person = lmap.get(r.ukey).unwrap_or(r.ukey);
-                            out.push(
+                            let person = lt.get(r.ukey).unwrap_or(r.ukey);
+                            out.push_r(
                                 &mut arena,
+                                &mut free,
                                 pbucket(person),
                                 PEv { person, ts: r.ts, pc: r.price | ((r.info & 0xFF) << 24) },
                             );
                         }
                     }
-                    Routed { _arena: arena, ev: out, cl: outc }
+                    out.finish(&mut arena);
+                    Routed { _arena: arena, ev: out.parts, cl: outc }
                 })
             })
             .collect();

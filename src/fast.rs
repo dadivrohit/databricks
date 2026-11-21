@@ -621,9 +621,11 @@ impl Arena {
 }
 
 /// N partitions of T, each a chain of fixed-size blocks from an arena.
+pub const BLOCK_BYTES: usize = 8192;
+
 pub struct Parts<T: Copy> {
-    head: Vec<*mut T>,
-    end: Vec<*mut T>,
+    pub(crate) head: Vec<*mut T>,
+    pub(crate) end: Vec<*mut T>,
     blocks: Vec<Vec<*mut T>>,
     blk: usize,
 }
@@ -650,8 +652,35 @@ impl<T: Copy> Parts<T> {
             *self.head.get_unchecked_mut(h) = hp.add(1);
         }
     }
+    /// push, taking new blocks from `free` (8 KB blocks) before the arena.
+    #[inline(always)]
+    pub fn push_r(&mut self, arena: &mut Arena, free: &mut Vec<*mut u8>, h: usize, v: T) {
+        unsafe {
+            let mut hp = *self.head.get_unchecked(h);
+            if hp == *self.end.get_unchecked(h) {
+                hp = self.grow_r(arena, free, h);
+            }
+            hp.write(v);
+            *self.head.get_unchecked_mut(h) = hp.add(1);
+        }
+    }
     #[cold]
-    fn grow(&mut self, arena: &mut Arena, h: usize) -> *mut T {
+    pub(crate) fn grow_r(&mut self, arena: &mut Arena, free: &mut Vec<*mut u8>, h: usize) -> *mut T {
+        debug_assert!(self.blk * std::mem::size_of::<T>() <= BLOCK_BYTES);
+        let p = match free.pop() {
+            Some(b) => b as *mut T,
+            None => arena.alloc(BLOCK_BYTES) as *mut T,
+        };
+        self.blocks[h].push(p);
+        self.end[h] = unsafe { p.add(self.blk) };
+        p
+    }
+    /// Raw block pointers of partition h (for recycling once consumed).
+    pub fn block_ptrs(&self, h: usize) -> &[*mut T] {
+        &self.blocks[h]
+    }
+    #[cold]
+    pub(crate) fn grow(&mut self, arena: &mut Arena, h: usize) -> *mut T {
         let p = arena.alloc(self.blk * std::mem::size_of::<T>()) as *mut T;
         self.blocks[h].push(p);
         self.end[h] = unsafe { p.add(self.blk) };
@@ -667,5 +696,86 @@ impl<T: Copy> Parts<T> {
     }
     pub fn len(&self, h: usize) -> usize {
         self.slices(h).map(|s| s.len()).sum()
+    }
+}
+
+/// Partitions with software write-combining: records are staged per partition in one
+/// cache line and flushed as a full 64-byte non-temporal store.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct Line([u8; 64]);
+
+pub struct WcParts<T: Copy> {
+    pub parts: Parts<T>,
+    stage: Vec<Line>,
+    fill: Vec<u8>,
+}
+unsafe impl<T: Copy> Send for WcParts<T> {}
+unsafe impl<T: Copy> Sync for WcParts<T> {}
+
+impl<T: Copy> WcParts<T> {
+    const K: usize = 64 / std::mem::size_of::<T>();
+    pub fn new(n: usize) -> Self {
+        assert!(64 % std::mem::size_of::<T>() == 0);
+        WcParts {
+            parts: Parts::new(n, BLOCK_BYTES / std::mem::size_of::<T>()),
+            stage: vec![Line([0; 64]); n],
+            fill: vec![0; n],
+        }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, arena: &mut Arena, h: usize, v: T) {
+        unsafe {
+            let f = *self.fill.get_unchecked(h) as usize;
+            let line = self.stage.get_unchecked_mut(h);
+            (line.0.as_mut_ptr() as *mut T).add(f).write(v);
+            if f + 1 < Self::K {
+                *self.fill.get_unchecked_mut(h) = (f + 1) as u8;
+                return;
+            }
+            *self.fill.get_unchecked_mut(h) = 0;
+            let p = &mut self.parts;
+            let mut hp = *p.head.get_unchecked(h);
+            if hp == *p.end.get_unchecked(h) {
+                hp = p.grow(arena, h);
+            }
+            let v512 = _mm512_load_si512(line.0.as_ptr() as *const _);
+            _mm512_stream_si512(hp as *mut _, v512);
+            *p.head.get_unchecked_mut(h) = hp.add(Self::K);
+        }
+    }
+    /// push, taking new blocks from `free` before the arena.
+    #[inline(always)]
+    pub fn push_r(&mut self, arena: &mut Arena, free: &mut Vec<*mut u8>, h: usize, v: T) {
+        unsafe {
+            let f = *self.fill.get_unchecked(h) as usize;
+            let line = self.stage.get_unchecked_mut(h);
+            (line.0.as_mut_ptr() as *mut T).add(f).write(v);
+            if f + 1 < Self::K {
+                *self.fill.get_unchecked_mut(h) = (f + 1) as u8;
+                return;
+            }
+            *self.fill.get_unchecked_mut(h) = 0;
+            let p = &mut self.parts;
+            let mut hp = *p.head.get_unchecked(h);
+            if hp == *p.end.get_unchecked(h) {
+                hp = p.grow_r(arena, free, h);
+            }
+            let v512 = _mm512_load_si512(line.0.as_ptr() as *const _);
+            _mm512_stream_si512(hp as *mut _, v512);
+            *p.head.get_unchecked_mut(h) = hp.add(Self::K);
+        }
+    }
+    /// Writes out the partially filled lines and fences the streaming stores.
+    pub fn finish(&mut self, arena: &mut Arena) {
+        for h in 0..self.fill.len() {
+            let f = self.fill[h] as usize;
+            for i in 0..f {
+                let v = unsafe { (self.stage[h].0.as_ptr() as *const T).add(i).read() };
+                self.parts.push(arena, h, v);
+            }
+            self.fill[h] = 0;
+        }
+        unsafe { _mm_sfence() };
     }
 }
