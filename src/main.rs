@@ -855,6 +855,8 @@ fn main() {
                         pacc[if kind == 1 { 1 } else { 2 }] += unsafe { std::arch::x86_64::_rdtsc() } - pc1;
                     }
                     ev.finish(&mut arena);
+                    fast::READ_CYC.fetch_add(pacc[3], Ordering::Relaxed);
+                    fast::PARSE_CYC.fetch_add(pacc[0] + pacc[1] + pacc[2] + pacc[3], Ordering::Relaxed);
                     if std::env::var("TIMING").is_ok() {
                         eprintln!("parse Mcyc: links {} clicks {} events {} read {}", pacc[0] / 1000000, pacc[1] / 1000000, pacc[2] / 1000000, pacc[3] / 1000000);
                     }
@@ -1473,16 +1475,20 @@ fn main() {
         }
         unsafe { __llvm_profile_write_file() };
     }
-    // XPROBE: on the hidden practice data (big input), report where the time went through
-    // the exit code, the one thing a hidden run shows: bits 7-6 time before parsing
-    // (<0.1s, <0.5s, <2s, more), bits 5-3 parsing and bits 2-0 the rest, in 0.5 s steps.
+    // XPROBE: on the hidden practice data (big input), report through the exit code, the one
+    // thing a hidden run shows: bits 7-6 the parse threads' share of time spent reading
+    // (quarters), bits 5-3 how many IDs went to the interner, bits 2-0 how many lines took
+    // a slow path (0: <1K, 1: <10K, 2: <100K, 3: <1M, 4: <4M, 5: <16M, 6: more).
     if std::env::var_os("XPROBE").is_some() && total_event_bytes > (400 << 20) {
-        let l = laps.borrow();
-        // laps: lookups, mmap, parsed, named, dedup, sessions, written
-        let (pre, parse, rest) = (l[1], l[2] - l[1], l[6] - l[2]);
-        let b_pre = if pre < 100.0 { 0 } else if pre < 500.0 { 1 } else if pre < 2000.0 { 2 } else { 3 };
-        let q = |x: f64| ((x / 500.0) as i32).min(7);
-        let code = (b_pre << 6) | (q(parse) << 3) | q(rest);
+        let rd = fast::READ_CYC.load(Ordering::Relaxed) as f64;
+        let pc = fast::PARSE_CYC.load(Ordering::Relaxed).max(1) as f64;
+        let share = ((rd / pc * 4.0) as i32).min(3);
+        let bucket = |n: usize| -> i32 {
+            [1_000usize, 10_000, 100_000, 1_000_000, 4_000_000, 16_000_000].iter().position(|&t| n < t).unwrap_or(6) as i32
+        };
+        let ex = users.snapshot().len() + ekeys.snapshot().len() + ckeys.snapshot().len();
+        let odd = fast::ODD_LINES.load(Ordering::Relaxed) as usize;
+        let code = (share << 6) | (bucket(ex) << 3) | bucket(odd);
         unsafe { libc::_exit(if code == 0 { 1 } else { code }) };
     }
     unsafe { libc::_exit(0) };

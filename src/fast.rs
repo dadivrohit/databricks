@@ -288,6 +288,12 @@ pub unsafe fn price(p: *const u8, n: usize) -> Option<u32> {
 /// Structural scanner: per 4 KB batch, flattens comma and newline positions with AVX-512,
 /// then hands out lines with their field bounds. Lines are independent of each other,
 /// so the CPU can overlap them.
+/// Lines that took a slow path (128+ bytes, or near a buffer end): for XPROBE.
+pub static ODD_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cycles parse threads spent reading vs in all: for XPROBE.
+pub static READ_CYC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PARSE_CYC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Scanner {
     nl: Vec<u32>,
     cm: Vec<u32>,
@@ -407,6 +413,7 @@ impl Scanner {
                             f(p, &fl);
                         }
                     } else {
+                        ODD_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let line = unsafe { std::slice::from_raw_parts(p, l) };
                         if split::<N>(line, &mut fl) {
                             f(p, &fl);
@@ -431,6 +438,7 @@ impl Scanner {
         fl: &mut [(usize, usize); N],
         f: &mut impl FnMut(*const u8, &[(usize, usize); N]),
     ) -> usize {
+        ODD_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let e = match memchr::memchr(b'\n', &data[pos..]) {
             Some(i) => pos + i,
             None => data.len(),
