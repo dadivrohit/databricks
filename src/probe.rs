@@ -74,7 +74,7 @@ fn pipeline_env(data: &str, out: &str, n: usize, extra: &[(&str, &str)]) -> Stri
             .and_then(|x| x.parse().ok())
             .unwrap_or(-1.0)
     };
-    let (m, p, nm, d, s, w) = (at("mmap"), at("parsed"), at("named"), at("dedup"), at("sessions"), at("written"));
+    let (m, p, nm, d, s, w) = (at("mmap"), at("parsed"), at("named"), at("dedup+"), at(" sessions"), at("written"));
     format!("{el:.0}={m:.0}+{:.0}+{:.0}+{:.0}+{:.0}+{:.0}", p - m, nm - p, d - nm, s - d, w - s)
 }
 
@@ -123,7 +123,109 @@ fn run3() -> ! {
     unsafe { libc::_exit(3) };
 }
 
+/// Fraction (per mille) of a directory tree's file pages resident in the page cache, and its bytes.
+fn resident(dir: &str) -> (u64, u64) {
+    let (mut tot, mut res) = (0u64, 0u64);
+    let mut stack = vec![std::path::PathBuf::from(dir)];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let path = e.path();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let len = md.len() as usize;
+            if len == 0 {
+                continue;
+            }
+            let Ok(f) = std::fs::File::open(&path) else { continue };
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                let m = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0);
+                if m == libc::MAP_FAILED {
+                    continue;
+                }
+                let pages = len.div_ceil(4096);
+                let mut v = vec![0u8; pages];
+                if libc::mincore(m, len, v.as_mut_ptr()) == 0 {
+                    res += v.iter().filter(|&&b| b & 1 != 0).count() as u64 * 4096;
+                }
+                libc::munmap(m, len);
+            }
+            tot += len as u64;
+        }
+    }
+    (tot, if tot == 0 { 0 } else { res.min(tot) * 1000 / tot })
+}
+
+fn first_line(path: &str) -> String {
+    read(path).lines().next().unwrap_or("-").trim().to_string()
+}
+
+/// PROBE=6: what the (new) scoring setup looks like, and the pipeline on the given input.
+fn run6() -> ! {
+    let mut r = String::new();
+    let cpu = read("/proc/cpuinfo");
+    let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").split(':').nth(1).unwrap_or("").trim().to_string();
+    let ncpu_info = cpu.lines().filter(|l| l.starts_with("processor")).count();
+    let par = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    let thp = first_line("/sys/kernel/mm/transparent_hugepage/enabled");
+    let defrag = first_line("/sys/kernel/mm/transparent_hugepage/defrag");
+    let _ = writeln!(r, "P6 {model} cpus={ncpu_info} par={par} kern={}", first_line("/proc/sys/kernel/osrelease"));
+    let _ = writeln!(r, "thp={thp} defrag={defrag}");
+    let _ = writeln!(r, "cg cpu.max={} mem.max={} mem.cur={}", first_line("/sys/fs/cgroup/cpu.max"), first_line("/sys/fs/cgroup/memory.max"), first_line("/sys/fs/cgroup/memory.current"));
+    let mi = read("/proc/meminfo");
+    let get = |k: &str| mi.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) >> 10;
+    let _ = writeln!(r, "memMB tot={} free={} avail={} cached={} dirty={}", get("MemTotal:"), get("MemFree:"), get("MemAvailable:"), get("Cached:"), get("Dirty:"));
+    let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
+    let (tot, pm) = resident(&data);
+    let mounts = read("/proc/mounts");
+    let mnt = mounts.lines().filter(|l| { let m = l.split_whitespace().nth(1).unwrap_or(""); data.starts_with(m) }).max_by_key(|l| l.split_whitespace().nth(1).unwrap_or("").len()).unwrap_or("?").to_string();
+    let _ = writeln!(r, "data={data} {}MB resident={pm}permil mnt={}", tot >> 20, mnt.split_whitespace().take(3).collect::<Vec<_>>().join(" "));
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into());
+    let out = format!("{scratch}/o6");
+    let _ = writeln!(r, "ms wall=start+parse+name+dedup+sess+write");
+    // the given input, first run decides cold vs warm
+    for (label, extra) in [("dev1", vec![]), ("dev2", vec![]), ("devNH", vec![("NOHUGE", "1")]), ("dev3", vec![])] {
+        let _ = writeln!(r, "{label}:{}", pipeline_env(&data, &out, 0, &extra));
+    }
+    let (_, pm2) = resident(&data);
+    let _ = writeln!(r, "dev resident after={pm2}permil");
+    let g = format!("{scratch}/g20");
+    let _ = std::fs::remove_dir_all(&g);
+    let t = Instant::now();
+    let st = std::process::Command::new("/proc/self/exe")
+        .env_remove("PROBE")
+        .args(["generate", "--seed", "3", "--events", "20000000", "--clicks", "5000000", "--output", &g, "--threads", "8"])
+        .output();
+    let ok = st.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    let (gt, gpm) = resident(&g);
+    let _ = writeln!(r, "gen20M ok={ok} {:.0}ms {}MB resident={gpm}permil", ms(t), gt >> 20);
+    let mi = read("/proc/meminfo");
+    let get = |k: &str| mi.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) >> 10;
+    let _ = writeln!(r, "memMB free={} avail={} cached={} cg.cur={}", get("MemFree:"), get("MemAvailable:"), get("Cached:"), first_line("/sys/fs/cgroup/memory.current"));
+    for (label, n, extra) in [
+        ("g8", 0usize, vec![]),
+        ("g8NH", 0, vec![("NOHUGE", "1")]),
+        ("g8", 0, vec![]),
+        ("g4", 4, vec![]),
+        ("g8NH", 0, vec![("NOHUGE", "1")]),
+        ("g8mm", 0, vec![("MMAP", "1")]),
+    ] {
+        let _ = writeln!(r, "{label}:{}", pipeline_env(&g, &out, n, &extra));
+    }
+    let (_, gpm2) = resident(&g);
+    let _ = writeln!(r, "g resident after={gpm2}permil END");
+    eprint!("{r}");
+    unsafe { libc::_exit(3) };
+}
+
 pub fn run() -> ! {
+    if std::env::var("PROBE").as_deref() == Ok("6") {
+        run6();
+    }
     if std::env::var("PROBE").as_deref() == Ok("3") {
         run3();
     }
