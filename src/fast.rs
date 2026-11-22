@@ -631,7 +631,7 @@ impl Arena {
             )
         };
         assert!(p != libc::MAP_FAILED, "arena mmap failed");
-        if std::env::var("NOHUGE").is_err() {
+        if std::env::var_os("HUGE").is_some() {
             unsafe { libc::madvise(p, cap, libc::MADV_HUGEPAGE) };
         }
         if std::env::var("PREFAULT").is_ok() {

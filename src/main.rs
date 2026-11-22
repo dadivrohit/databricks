@@ -686,6 +686,18 @@ fn main() {
     let nlink_chunks = chunks.len();
     make_chunks(&files, 1, &mut chunks);
     make_chunks(&files, 0, &mut chunks);
+    // Ask the kernel to start reading every input file now, in the order they will be
+    // parsed, from a background thread: free when the files are already in memory, and
+    // keeps many reads in flight when they are not.
+    if std::env::var_os("NORA").is_none() {
+        use std::os::unix::io::AsRawFd;
+        let plan: Vec<(i32, usize, usize)> = chunks.iter().map(|c| (files[c.file as usize].0.f.as_raw_fd(), c.start, c.end)).collect();
+        std::thread::spawn(move || {
+            for (fd, a, e) in plan {
+                unsafe { libc::posix_fadvise(fd, a as libc::off_t, (e - a) as libc::off_t, libc::POSIX_FADV_WILLNEED) };
+            }
+        });
+    }
     lap("mmap");
 
     let users = Interner::new();
