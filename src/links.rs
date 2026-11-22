@@ -19,7 +19,7 @@ fn huge_zeroed(bytes: usize) -> *mut u8 {
             0,
         );
         assert!(p != libc::MAP_FAILED, "link table mmap failed");
-        if std::env::var("HUGE").is_ok() {
+        if std::env::var("NOHUGE").is_err() {
             libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
         }
         p as *mut u8
