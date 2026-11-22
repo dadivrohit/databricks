@@ -222,7 +222,149 @@ fn run6() -> ! {
     unsafe { libc::_exit(3) };
 }
 
+/// Files (sorted, largest first) under data/{events,clicks,links}.
+fn data_files(data: &str) -> Vec<(String, usize)> {
+    let mut v = Vec::new();
+    for sub in ["events", "clicks", "links"] {
+        if let Ok(rd) = std::fs::read_dir(format!("{data}/{sub}")) {
+            for e in rd.flatten() {
+                let l = e.metadata().map(|m| m.len() as usize).unwrap_or(0);
+                v.push((e.path().to_string_lossy().into_owned(), l));
+            }
+        }
+    }
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    v
+}
+
+/// Reads every file with pread in `chunk`-byte pieces over `nt` threads; returns MB/s.
+fn bw_pread(files: &[(String, usize)], chunk: usize, nt: usize) -> f64 {
+    use std::os::unix::io::AsRawFd;
+    let total: usize = files.iter().map(|f| f.1).sum();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut work = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let mut o = 0;
+        while o < f.1 {
+            work.push((i, o, chunk.min(f.1 - o)));
+            o += chunk;
+        }
+    }
+    let fds: Vec<std::fs::File> = files.iter().map(|f| std::fs::File::open(&f.0).unwrap()).collect();
+    let t = Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|| {
+                let mut buf = vec![0u8; chunk];
+                let mut x = 0u64;
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= work.len() {
+                        break;
+                    }
+                    let (i, o, n) = work[k];
+                    unsafe { libc::pread(fds[i].as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, n, o as libc::off_t) };
+                    x = x.wrapping_add(buf[0] as u64);
+                }
+                std::hint::black_box(x);
+            });
+        }
+    });
+    total as f64 / 1e6 / t.elapsed().as_secs_f64()
+}
+
+/// mmaps every file (populate or touch) over `nt` threads; returns MB/s.
+fn bw_mmap(files: &[(String, usize)], populate: bool, nt: usize) -> f64 {
+    use std::os::unix::io::AsRawFd;
+    let total: usize = files.iter().map(|f| f.1).sum();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let t = Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|| {
+                let mut x = 0u64;
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= files.len() {
+                        break;
+                    }
+                    let f = std::fs::File::open(&files[k].0).unwrap();
+                    let n = files[k].1;
+                    if n == 0 {
+                        continue;
+                    }
+                    unsafe {
+                        let fl = libc::MAP_PRIVATE | if populate { libc::MAP_POPULATE } else { 0 };
+                        let m = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, fl, f.as_raw_fd(), 0) as *const u8;
+                        let mut o = 0;
+                        while o < n {
+                            x = x.wrapping_add(*m.add(o) as u64);
+                            o += 4096;
+                        }
+                        libc::munmap(m as *mut libc::c_void, n);
+                    }
+                }
+                std::hint::black_box(x);
+            });
+        }
+    });
+    total as f64 / 1e6 / t.elapsed().as_secs_f64()
+}
+
+/// PROBE=7: how fast the given input (/data) can be read, and the pipeline's read options on it.
+fn run7() -> ! {
+    let mut r = String::new();
+    let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
+    let files = data_files(&data);
+    let total: usize = files.iter().map(|f| f.1).sum();
+    let _ = writeln!(r, "P7 data={data} files={} {}MB max={}KB", files.len(), total >> 20, files.first().map(|f| f.1 >> 10).unwrap_or(0));
+    let _ = writeln!(r, "MB/s pread 256K: t1={:.0} t8={:.0} | 4M: t1={:.0} t8={:.0} | 64K t8={:.0}",
+        bw_pread(&files, 256 << 10, 1), bw_pread(&files, 256 << 10, 8), bw_pread(&files, 4 << 20, 1), bw_pread(&files, 4 << 20, 8), bw_pread(&files, 64 << 10, 8));
+    let _ = writeln!(r, "MB/s mmap touch: t1={:.0} t8={:.0} | populate: t1={:.0} t8={:.0}",
+        bw_mmap(&files, false, 1), bw_mmap(&files, false, 8), bw_mmap(&files, true, 1), bw_mmap(&files, true, 8));
+    let _ = writeln!(r, "MB/s again pread256K t8={:.0} mmap-touch t8={:.0}", bw_pread(&files, 256 << 10, 8), bw_mmap(&files, false, 8));
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into());
+    let out = format!("{scratch}/o7");
+    let _ = writeln!(r, "ms wall=start+parse+name+dedup+sess+write");
+    for (label, extra) in [
+        ("base", vec![]),
+        ("mmap", vec![("MMAP", "1")]),
+        ("c2048", vec![("CHUNKKB", "2048")]),
+        ("c64", vec![("CHUNKKB", "64")]),
+        ("base", vec![]),
+        ("mmap", vec![("MMAP", "1")]),
+        ("c2048", vec![("CHUNKKB", "2048")]),
+    ] {
+        let _ = writeln!(r, "{label}:{}", pipeline_env(&data, &out, 0, &extra));
+    }
+    // copy the input to /scratch and time the pipeline there (page cache, not /data)
+    let cp = format!("{scratch}/dcopy");
+    let _ = std::fs::remove_dir_all(&cp);
+    let t = Instant::now();
+    for sub in ["events", "clicks", "links"] {
+        let _ = std::fs::create_dir_all(format!("{cp}/{sub}"));
+        if let Ok(rd) = std::fs::read_dir(format!("{data}/{sub}")) {
+            for e in rd.flatten() {
+                let _ = std::fs::copy(e.path(), format!("{cp}/{sub}/{}", e.file_name().to_string_lossy()));
+            }
+        }
+    }
+    for f in ["manifest.json", "products.csv", "campaigns.csv"] {
+        let _ = std::fs::copy(format!("{data}/{f}"), format!("{cp}/{f}"));
+    }
+    let _ = writeln!(r, "copied to scratch {:.0}ms", ms(t));
+    for (label, extra) in [("scr", vec![]), ("scrmm", vec![("MMAP", "1")]), ("scr", vec![])] {
+        let _ = writeln!(r, "{label}:{}", pipeline_env(&cp, &out, 0, &extra));
+    }
+    let _ = writeln!(r, "END");
+    eprint!("{r}");
+    unsafe { libc::_exit(3) };
+}
+
 pub fn run() -> ! {
+    if std::env::var("PROBE").as_deref() == Ok("7") {
+        run7();
+    }
     if std::env::var("PROBE").as_deref() == Ok("6") {
         run6();
     }
