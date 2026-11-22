@@ -525,19 +525,20 @@ struct ClickRec {
     camp: u32,
 }
 
-const P_BITS: u32 = 10;
-const Q_BITS: u32 = 10;
-const NP: usize = 1 << P_BITS;
-const NQ: usize = 1 << Q_BITS;
+/// Partition counts (log2) for the event-ID scatter and the person scatter; env PBITS / QBITS.
+fn part_bits() -> (u32, u32) {
+    let get = |n: &str| std::env::var(n).ok().and_then(|v| v.parse::<u32>().ok()).filter(|b| (6..=14).contains(b)).unwrap_or(10);
+    (get("PBITS"), get("QBITS"))
+}
 
 #[inline(always)]
-fn epart(k: u64) -> usize {
+fn epart(k: u64, sh: u32) -> usize {
     // keys are already well spread (scrambled IDs, or interned indexes); one multiply is enough
-    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - P_BITS)) as usize
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> sh) as usize
 }
 #[inline(always)]
-fn pbucket(k: u64) -> usize {
-    (mix(k.wrapping_add(0x1234_5678_9ABC_DEF1)) >> (64 - Q_BITS)) as usize
+fn pbucket(k: u64, sh: u32) -> usize {
+    (mix(k.wrapping_add(0x1234_5678_9ABC_DEF1)) >> sh) as usize
 }
 
 struct UserRow {
@@ -567,6 +568,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = PathBuf::from(if args.len() >= 3 { args[1].clone() } else { env("DATA_DIR", "/data") });
     let out_dir = PathBuf::from(if args.len() >= 3 { args[2].clone() } else { env("OUTPUT_DIR", "/output") });
+    let (p_bits, q_bits) = part_bits();
+    #[allow(non_snake_case)]
+    let (NP, NQ) = (1usize << p_bits, 1usize << q_bits);
+    let (psh, qsh) = (64 - p_bits, 64 - q_bits);
     let nthreads: usize = env("NCPU", "0")
         .parse()
         .ok()
@@ -819,7 +824,7 @@ fn main() {
                                         }
                                     }
                                     let info = ((valid as u32) << 31) | cat;
-                                    ev.push(&mut arena, epart(ekey), EventRec { ekey, ukey, ingest, ts: tsr, info, price });
+                                    ev.push(&mut arena, epart(ekey, psh), EventRec { ekey, ukey, ingest, ts: tsr, info, price });
                                 });
                             }
                         }
@@ -937,7 +942,7 @@ fn main() {
                                     lt.prefetch(src[i + 32].ukey);
                                 }
                                 let person = lt.person(c.ukey, LINKTAG);
-                                outc.push_r(&mut arena, &mut free, pbucket(person), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
+                                outc.push_r(&mut arena, &mut free, pbucket(person, qsh), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                             }
                             }
                             dacc[2] += unsafe { std::arch::x86_64::_rdtsc() } - c0;
@@ -1009,7 +1014,7 @@ fn main() {
                             out.push_r(
                                 &mut arena,
                                 &mut free,
-                                pbucket(person),
+                                pbucket(person, qsh),
                                 PEv { person, ts: r.ts, pc: r.price | ((r.info & 0xFF) << 24) },
                             );
                         }
@@ -1046,10 +1051,17 @@ fn main() {
         assist: Vec<u32>,    // [day * ncols + campaign]
     }
     let ncols = ncamp + 1; // last = organic
+    let ukeys = Keys { prefix: b'u', exotic: users.snapshot() };
+    let ud_dir = out_dir.join("user_daily");
+    let cd_dir = out_dir.join("campaign_daily");
+    fs::create_dir_all(&ud_dir).unwrap();
+    fs::create_dir_all(&cd_dir).unwrap();
+    let next_tid = AtomicUsize::new(0);
     let results: Vec<Out> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
                 s.spawn(|| {
+                    let ti = next_tid.fetch_add(1, Ordering::Relaxed);
                     let mut o = Out { rows: Vec::new(), camp: vec![(0, 0, 0); ncols * ndays], assist: vec![0; ncols * ndays] };
                     let mut evs: Vec<(u64, u32, u32)> = Vec::new(); // (idx<<32|ts, price, cat)
                     let mut evs2: Vec<(u64, u32, u32)> = Vec::new();
@@ -1076,8 +1088,9 @@ fn main() {
                         if n == 0 {
                             continue;
                         }
-                        let cap = (n * 2).next_power_of_two();
-                        let mask = cap - 1;
+                        // sized for persons (about one per dozen events), grown if needed
+                        let mut cap = (n / 2).max(256).next_power_of_two();
+                        let mut mask = cap - 1;
                         let t0 = unsafe { std::arch::x86_64::_rdtsc() };
                         ltab.clear();
                         ltab.resize(cap, 0);
@@ -1093,6 +1106,19 @@ fn main() {
                                             ltab[h] = pkeys.len() as u32 + 1;
                                             pkeys.push(e.person);
                                             pcnt.push(0);
+                                            if pkeys.len() * 10 > cap * 7 {
+                                                cap *= 2;
+                                                mask = cap - 1;
+                                                ltab.clear();
+                                                ltab.resize(cap, 0);
+                                                for (x, &pk) in pkeys.iter().enumerate() {
+                                                    let mut g = (mix(pk) as usize) & mask;
+                                                    while ltab[g] != 0 {
+                                                        g = (g + 1) & mask;
+                                                    }
+                                                    ltab[g] = x as u32 + 1;
+                                                }
+                                            }
                                             break pkeys.len() as u32 - 1;
                                         }
                                         if unsafe { *pkeys.get_unchecked(slot as usize - 1) } == e.person {
@@ -1325,6 +1351,9 @@ fn main() {
                         }
                         pcnt.clear();
                     }
+                    // this thread's user_daily part, written while other threads may still be working
+                    write_user_daily(&o.rows, &ud_dir.join(format!("part-{ti}.parquet")), &ukeys, &cats, &lt);
+                    o.rows = Vec::new();
                     if std::env::var("TIMING").is_ok() {
                         let tot = unsafe { std::arch::x86_64::_rdtsc() } - tstart;
                         eprintln!("sess Mcyc: gather {} group {} (scatter {}) clicks {} rest {}", tacc[0] / 1000000, tacc[1] / 1000000, tacc[3] / 1000000, tacc[2] / 1000000, (tot - tacc[0] - tacc[1] - tacc[2]) / 1000000);
@@ -1337,12 +1366,7 @@ fn main() {
     });
     lap("sessions");
 
-    // ---- write outputs
-    let ukeys = Keys { prefix: b'u', exotic: users.snapshot() };
-    let ud_dir = out_dir.join("user_daily");
-    let cd_dir = out_dir.join("campaign_daily");
-    fs::create_dir_all(&ud_dir).unwrap();
-    fs::create_dir_all(&cd_dir).unwrap();
+    // ---- write outputs (user_daily parts were written by the session threads)
     std::thread::scope(|s| {
         for a in parsed.iter().map(|p| &p._arena).chain(routed.iter().map(|r| &r._arena)) {
             s.spawn(move || a.release());
@@ -1355,63 +1379,6 @@ fn main() {
                         f.0.release();
                     }
                 }
-            });
-        }
-        for (ti, o) in results.iter().enumerate() {
-            let ukeys = &ukeys;
-            let cats = &cats;
-            let ud_dir = &ud_dir;
-            let lt = &lt;
-            s.spawn(move || {
-                let rows = &o.rows;
-                let n = rows.len();
-                let mut uid = Vec::with_capacity(n * 14);
-                let mut tmp = Vec::new();
-                let mut top = Vec::new();
-                let mut defined = vec![0u8; n.div_ceil(8) + 1];
-                for (r_i, r) in rows.iter().enumerate() {
-                    tmp.clear();
-                    let pk = if r.person & LINKTAG == LINKTAG { lt.name((r.person & 0xFFFF_FFFF) as u32) } else { r.person };
-                    ukeys.bytes(pk, &mut tmp);
-                    uid.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
-                    uid.extend_from_slice(&tmp);
-                    if r.top >= 0 {
-                        defined[r_i / 8] |= 1 << (r_i % 8);
-                        let c = &cats[r.top as usize];
-                        top.extend_from_slice(&(c.len() as u32).to_le_bytes());
-                        top.extend_from_slice(c);
-                    }
-                }
-                use parquet::{Column, Logical, Values};
-                let cols = vec![
-                    Column { name: "user_id", values: Values::Bytes(uid), defined: None, logical: Logical::String },
-                    Column {
-                        name: "day",
-                        values: Values::I32(rows.iter().map(|r| r.day).collect()),
-                        defined: None,
-                        logical: Logical::Date,
-                    },
-                    Column {
-                        name: "sessions",
-                        values: Values::I32(rows.iter().map(|r| r.sessions as i32).collect()),
-                        defined: None,
-                        logical: Logical::None,
-                    },
-                    Column {
-                        name: "events",
-                        values: Values::I32(rows.iter().map(|r| r.events as i32).collect()),
-                        defined: None,
-                        logical: Logical::None,
-                    },
-                    Column {
-                        name: "revenue_cents",
-                        values: Values::I64(rows.iter().map(|r| r.revenue).collect()),
-                        defined: None,
-                        logical: Logical::None,
-                    },
-                    Column { name: "top_category", values: Values::Bytes(top), defined: Some(defined), logical: Logical::String },
-                ];
-                parquet::write_file(&ud_dir.join(format!("part-{ti}.parquet")), &cols, n).unwrap();
             });
         }
         let mut agg = vec![[0i64; 4]; ncols * ndays]; // [campaign * ndays + day]
@@ -1506,6 +1473,58 @@ unsafe fn rank_sort32_into(src: *const (u64, u32, u32), dst: *mut (u64, u32, u32
             }
         }
     }
+}
+
+/// Writes one user_daily part file from a thread's rows.
+fn write_user_daily(rows: &[UserRow], path: &Path, ukeys: &Keys, cats: &[Vec<u8>], lt: &links::LinkTable) {
+        let n = rows.len();
+        let mut uid = Vec::with_capacity(n * 14);
+        let mut tmp = Vec::new();
+        let mut top = Vec::new();
+        let mut defined = vec![0u8; n.div_ceil(8) + 1];
+        for (r_i, r) in rows.iter().enumerate() {
+            tmp.clear();
+            let pk = if r.person & LINKTAG == LINKTAG { lt.name((r.person & 0xFFFF_FFFF) as u32) } else { r.person };
+            ukeys.bytes(pk, &mut tmp);
+            uid.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
+            uid.extend_from_slice(&tmp);
+            if r.top >= 0 {
+                defined[r_i / 8] |= 1 << (r_i % 8);
+                let c = &cats[r.top as usize];
+                top.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                top.extend_from_slice(c);
+            }
+        }
+        use parquet::{Column, Logical, Values};
+        let cols = vec![
+            Column { name: "user_id", values: Values::Bytes(uid), defined: None, logical: Logical::String },
+            Column {
+                name: "day",
+                values: Values::I32(rows.iter().map(|r| r.day).collect()),
+                defined: None,
+                logical: Logical::Date,
+            },
+            Column {
+                name: "sessions",
+                values: Values::I32(rows.iter().map(|r| r.sessions as i32).collect()),
+                defined: None,
+                logical: Logical::None,
+            },
+            Column {
+                name: "events",
+                values: Values::I32(rows.iter().map(|r| r.events as i32).collect()),
+                defined: None,
+                logical: Logical::None,
+            },
+            Column {
+                name: "revenue_cents",
+                values: Values::I64(rows.iter().map(|r| r.revenue).collect()),
+                defined: None,
+                logical: Logical::None,
+            },
+            Column { name: "top_category", values: Values::Bytes(top), defined: Some(defined), logical: Logical::String },
+        ];
+        parquet::write_file(path, &cols, n).unwrap();
 }
 
 fn finish_row(row: &UserRow, catsum: &mut Vec<(u32, i64)>, day: i32, first_day: i64) -> UserRow {
