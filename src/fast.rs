@@ -10,6 +10,20 @@ pub unsafe fn ld32(p: *const u8) -> u32 {
     unsafe { std::ptr::read_unaligned(p as *const u32) }
 }
 
+/// Comma and quote masks for 128 bytes at p.
+#[inline(always)]
+pub unsafe fn masks128_cq(p: *const u8) -> (u128, u128) {
+    unsafe {
+        let a = _mm512_loadu_si512(p as *const _);
+        let b = _mm512_loadu_si512(p.add(64) as *const _);
+        let cm = _mm512_set1_epi8(b',' as i8);
+        let qt = _mm512_set1_epi8(b'"' as i8);
+        let c = (_mm512_cmpeq_epi8_mask(a, cm) as u128) | ((_mm512_cmpeq_epi8_mask(b, cm) as u128) << 64);
+        let q = (_mm512_cmpeq_epi8_mask(a, qt) as u128) | ((_mm512_cmpeq_epi8_mask(b, qt) as u128) << 64);
+        (c, q)
+    }
+}
+
 /// Newline, comma and quote masks for 128 bytes at p.
 #[inline(always)]
 pub unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
@@ -58,9 +72,10 @@ pub unsafe fn fields<const N: usize>(p: *const u8, len: usize, cm: u128, qm: u12
         if qm != (qs | qe) || (qs & qe) != 0 || qe != (term >> 1) {
             return false;
         }
+        // validated above: a field starts with a quote exactly when it is quoted
         for i in 0..N {
             let (s, e) = f[i];
-            let q = ((qs >> s) & 1) as usize;
+            let q = (unsafe { *p.add(s) } == b'"') as usize;
             f[i] = (s + q, e - q);
         }
     }
@@ -374,7 +389,7 @@ impl Scanner {
                     let l = le - ls;
                     let p = unsafe { base.add(r0 + ls) };
                     if l < 128 {
-                        let (_, cm, qm) = unsafe { masks128(p) };
+                        let (cm, qm) = unsafe { masks128_cq(p) };
                         let lm = (1u128 << l) - 1;
                         if unsafe { fields::<N>(p, l, cm & lm, qm & lm, &mut fl) } {
                             f(p, &fl);

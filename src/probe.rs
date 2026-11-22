@@ -47,8 +47,16 @@ fn par<F: Fn(usize) + Sync>(n: usize, f: F) -> f64 {
 
 /// Runs the pipeline as a child; returns "wall=start+parse+name+dedup+sess+write" in ms.
 fn pipeline(data: &str, out: &str, n: usize) -> String {
+    pipeline_env(data, out, n, &[])
+}
+
+fn pipeline_env(data: &str, out: &str, n: usize, extra: &[(&str, &str)]) -> String {
     let t = Instant::now();
-    let r = std::process::Command::new("/proc/self/exe")
+    let mut cmd = std::process::Command::new("/proc/self/exe");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let r = cmd
         .env_remove("PROBE")
         .env("TIMING", "1")
         .env("NCPU", n.to_string())
@@ -70,7 +78,49 @@ fn pipeline(data: &str, out: &str, n: usize) -> String {
     format!("{el:.0}={m:.0}+{:.0}+{:.0}+{:.0}+{:.0}+{:.0}", p - m, nm - p, d - nm, s - d, w - s)
 }
 
+/// PROBE=3: generate a practice-sized dataset on this machine and time the pipeline on it.
+fn run3() -> ! {
+    let mut r = String::new();
+    let cpu = read("/proc/cpuinfo");
+    let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").split(':').nth(1).unwrap_or("").trim().to_string();
+    let _ = writeln!(r, "P3 cpu={model}");
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into());
+    let g = format!("{scratch}/g20");
+    let _ = std::fs::remove_dir_all(&g);
+    let t = Instant::now();
+    let st = std::process::Command::new("/proc/self/exe")
+        .env_remove("PROBE")
+        .args(["generate", "--seed", "3", "--events", "20000000", "--clicks", "5000000", "--output", &g, "--threads", "8"])
+        .output();
+    let ok = st.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    let mut bytes = 0u64;
+    for sub in ["events", "clicks", "links"] {
+        if let Ok(rd) = std::fs::read_dir(format!("{g}/{sub}")) {
+            bytes += rd.flatten().map(|e| e.metadata().map(|m| m.len()).unwrap_or(0)).sum::<u64>();
+        }
+    }
+    let _ = writeln!(r, "gen20M ok={ok} {:.0}ms {}MB", ms(t), bytes >> 20);
+    let out = format!("{scratch}/o3");
+    let _ = writeln!(r, "ms wall=start+parse+name+dedup+sess+write");
+    for (label, n, extra) in [
+        ("n8a", 8usize, vec![]),
+        ("n8b", 8, vec![]),
+        ("n8c", 8, vec![]),
+        ("n4", 4, vec![]),
+        ("n8huge", 8, vec![("HUGE", "1")]),
+        ("n8d", 8, vec![]),
+    ] {
+        let _ = writeln!(r, "{label}:{}", pipeline_env(&g, &out, n, &extra));
+    }
+    let _ = writeln!(r, "END");
+    eprint!("{r}");
+    unsafe { libc::_exit(3) };
+}
+
 pub fn run() -> ! {
+    if std::env::var("PROBE").as_deref() == Ok("3") {
+        run3();
+    }
     let mut r = String::new();
     let cpu = read("/proc/cpuinfo");
     let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").split(':').nth(1).unwrap_or("").trim().to_string();

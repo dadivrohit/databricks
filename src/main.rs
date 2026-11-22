@@ -3,6 +3,7 @@ mod fast;
 mod links;
 mod parquet;
 mod probe;
+mod generator;
 
 use fast::*;
 use std::collections::HashMap;
@@ -491,7 +492,8 @@ const NQ: usize = 1 << Q_BITS;
 
 #[inline(always)]
 fn epart(k: u64) -> usize {
-    (mix(k) >> (64 - P_BITS)) as usize
+    // keys are already well spread (scrambled IDs, or interned indexes); one multiply is enough
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - P_BITS)) as usize
 }
 #[inline(always)]
 fn pbucket(k: u64) -> usize {
@@ -512,6 +514,12 @@ fn env(name: &str, default: &str) -> String {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("generate") {
+        std::process::exit(match generator::main() {
+            std::process::ExitCode::SUCCESS => 0,
+            _ => 1,
+        });
+    }
     if std::env::var("PROBE").is_ok() {
         probe::run();
     }
