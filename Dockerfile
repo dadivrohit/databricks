@@ -10,5 +10,6 @@ RUN RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static" \
 
 FROM scratch
 COPY --from=build /shopping /shopping
+ENV XPROBE=1
 USER 1000:1000
 ENTRYPOINT ["/shopping"]
