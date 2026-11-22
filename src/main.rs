@@ -583,7 +583,9 @@ fn main() {
         .parse()
         .ok()
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        // At most 4 threads: the scorer's 8 CPUs are 4 cores' hyperthreads on a shared host,
+        // where 8 threads cost ~70% more CPU time (and far more kernel time) for little speed.
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(4));
     let timing = std::env::var("TIMING").is_ok();
     let lap = |what: &str| {
         if timing {
