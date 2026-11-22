@@ -2,7 +2,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 pub struct LinkTable {
-    pub slots: &'static [[AtomicU64; 2]], // key, !name (0 until named)
+    pub keys: &'static [AtomicU64],  // key per slot (0 = empty)
+    pub names: &'static [AtomicU64], // !name of the person, at root slots
     pub parent: &'static [AtomicU32],
     pub mask: usize,
 }
@@ -36,11 +37,13 @@ pub fn mix(x: u64) -> u64 {
 impl LinkTable {
     pub fn new(cap_hint: usize) -> Self {
         let cap = cap_hint.next_power_of_two().max(1024);
-        let slots: &'static [[AtomicU64; 2]] =
-            unsafe { std::slice::from_raw_parts(huge_zeroed(cap * 16) as *const [AtomicU64; 2], cap) };
+        let keys: &'static [AtomicU64] =
+            unsafe { std::slice::from_raw_parts(huge_zeroed(cap * 8) as *const AtomicU64, cap) };
+        let names: &'static [AtomicU64] =
+            unsafe { std::slice::from_raw_parts(huge_zeroed(cap * 8) as *const AtomicU64, cap) };
         let parent: &'static [AtomicU32] =
             unsafe { std::slice::from_raw_parts(huge_zeroed(cap * 4) as *const AtomicU32, cap) };
-        LinkTable { slots, parent, mask: cap - 1 }
+        LinkTable { keys, names, parent, mask: cap - 1 }
     }
 
     /// Slot of key, inserting it. Thread-safe.
@@ -49,13 +52,13 @@ impl LinkTable {
         let mut i = (mix(k) as usize) & self.mask;
         let mut probes = 0;
         loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            let cur = s[0].load(Relaxed);
+            let s = unsafe { self.keys.get_unchecked(i) };
+            let cur = s.load(Relaxed);
             if cur == k {
                 return i as u32;
             }
             if cur == 0 {
-                match s[0].compare_exchange(0, k, Relaxed, Relaxed) {
+                match s.compare_exchange(0, k, Relaxed, Relaxed) {
                     Ok(_) => {
                         return i as u32;
                     }
@@ -106,15 +109,15 @@ impl LinkTable {
         }
     }
 
-    /// key -> person name, for linked keys.
+    /// key -> root slot of its person, for linked keys (after `flatten`).
     #[inline(always)]
-    pub fn get(&self, k: u64) -> Option<u64> {
+    pub fn get(&self, k: u64) -> Option<u32> {
         let mut i = (mix(k) as usize) & self.mask;
         loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            let cur = s[0].load(Relaxed);
+            let cur = unsafe { self.keys.get_unchecked(i) }.load(Relaxed);
             if cur == k {
-                return Some(!s[1].load(Relaxed));
+                let p = unsafe { self.parent.get_unchecked(i) }.load(Relaxed);
+                return Some(if p == 0 { i as u32 } else { p - 1 });
             }
             if cur == 0 {
                 return None;
@@ -123,11 +126,18 @@ impl LinkTable {
         }
     }
 
+    /// Name of the person rooted at slot r.
+    #[inline(always)]
+    pub fn name(&self, r: u32) -> u64 {
+        !self.names[r as usize].load(Relaxed)
+    }
+
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
         let i = (mix(k) as usize) & self.mask;
         unsafe {
-            std::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0)
+            std::arch::x86_64::_mm_prefetch(self.keys.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(self.parent.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0)
         };
     }
 }

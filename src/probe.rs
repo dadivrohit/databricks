@@ -103,12 +103,18 @@ fn run3() -> ! {
     let out = format!("{scratch}/o3");
     let _ = writeln!(r, "ms wall=start+parse+name+dedup+sess+write");
     for (label, n, extra) in [
-        ("n8a", 8usize, vec![]),
-        ("n8b", 8, vec![]),
-        ("n8c", 8, vec![]),
-        ("n4", 4, vec![]),
-        ("n8huge", 8, vec![("HUGE", "1")]),
-        ("n8d", 8, vec![]),
+        ("base", 8usize, vec![]),
+        ("lt12", 8, vec![("LTDIV", "12")]),
+        ("c128", 8, vec![("CHUNKKB", "128")]),
+        ("lt3", 8, vec![("LTDIV", "3")]),
+        ("base", 8, vec![]),
+        ("lt12", 8, vec![("LTDIV", "12")]),
+        ("c128", 8, vec![("CHUNKKB", "128")]),
+        ("c512", 8, vec![("CHUNKKB", "512")]),
+        ("base", 8, vec![]),
+        ("lt12", 8, vec![("LTDIV", "12")]),
+        ("c128", 8, vec![("CHUNKKB", "128")]),
+        ("lt3", 8, vec![("LTDIV", "3")]),
     ] {
         let _ = writeln!(r, "{label}:{}", pipeline_env(&g, &out, n, &extra));
     }

@@ -17,6 +17,8 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const EXOTIC: u64 = 1 << 63;
+/// person id of a linked ID: tag | root slot in the link table (exotic keys never set bit 62)
+const LINKTAG: u64 = 3 << 62;
 
 // ---------------------------------------------------------------- utilities
 
@@ -311,7 +313,7 @@ struct ChunkReader {
 
 impl ChunkReader {
     fn new() -> Self {
-        ChunkReader { buf: Vec::with_capacity(CHUNK + (64 << 10) + fast::SLACK) }
+        ChunkReader { buf: Vec::with_capacity(chunk_bytes() + (64 << 10) + fast::SLACK) }
     }
     fn read_at(&mut self, m: &Mapped, at: usize, n: usize) {
         use std::os::unix::io::AsRawFd;
@@ -381,7 +383,10 @@ struct Chunk {
     end: usize,
 }
 
-const CHUNK: usize = 256 << 10;
+fn chunk_bytes() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("CHUNKKB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256) << 10)
+}
 
 fn make_chunks(files: &[(Mapped, u8)], kind: u8, v: &mut Vec<Chunk>) {
     for (i, (m, k)) in files.iter().enumerate() {
@@ -390,7 +395,7 @@ fn make_chunks(files: &[(Mapped, u8)], kind: u8, v: &mut Vec<Chunk>) {
         }
         let mut s = 0;
         while s < m.len {
-            let e = (s + CHUNK).min(m.len);
+            let e = (s + chunk_bytes()).min(m.len);
             v.push(Chunk { file: i as u32, kind, start: s, end: e });
             s = e;
         }
@@ -648,7 +653,7 @@ fn main() {
     // ---- parse everything; the last link chunk's thread runs union-find meanwhile
     let total_event_bytes: usize = files.iter().filter(|f| f.1 == 0).map(|f| f.0.len).sum();
     let link_bytes: usize = files.iter().filter(|f| f.1 == 2).map(|f| f.0.len).sum();
-    let lt = links::LinkTable::new(link_bytes / 6 + 1024);
+    let lt = links::LinkTable::new(link_bytes / std::env::var("LTDIV").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize) + 1024);
     let next = AtomicUsize::new(nlink_chunks);
     let next_link = AtomicUsize::new(0);
     let barrier = std::sync::Barrier::new(nthreads);
@@ -806,7 +811,7 @@ fn main() {
                 let (r0, r1) = (cap * tid / nthreads, cap * (tid + 1) / nthreads);
                 let mut exo = Vec::new();
                 for slot in r0..r1 {
-                    let k = lt.slots[slot][0].load(Ordering::Relaxed);
+                    let k = lt.keys[slot].load(Ordering::Relaxed);
                     if k == 0 {
                         continue;
                     }
@@ -814,7 +819,7 @@ fn main() {
                         exo.push(slot as u32);
                     } else {
                         let r = lt.find(slot as u32) as usize;
-                        lt.slots[r][1].fetch_max(!k, Ordering::Relaxed);
+                        lt.names[r].fetch_max(!k, Ordering::Relaxed);
                     }
                 }
                 if !exo.is_empty() {
@@ -826,24 +831,24 @@ fn main() {
                     if !ex.is_empty() {
                         let uk = Keys { prefix: b'u', exotic: users.snapshot() };
                         for slot in ex {
-                            let k = lt.slots[slot as usize][0].load(Ordering::Relaxed);
+                            let k = lt.keys[slot as usize].load(Ordering::Relaxed);
                             let r = lt.find(slot) as usize;
-                            let cur = !lt.slots[r][1].load(Ordering::Relaxed);
+                            let cur = !lt.names[r].load(Ordering::Relaxed);
                             if cur == u64::MAX || uk.cmp(k, cur) == std::cmp::Ordering::Less {
-                                lt.slots[r][1].store(!k, Ordering::Relaxed);
+                                lt.names[r].store(!k, Ordering::Relaxed);
                             }
                         }
                     }
                 }
                 barrier.wait();
                 for slot in r0..r1 {
-                    if lt.slots[slot][0].load(Ordering::Relaxed) == 0 {
+                    if lt.keys[slot].load(Ordering::Relaxed) == 0 {
                         continue;
                     }
+                    // point every slot straight at its root (only ever moves a slot closer to it)
                     let r = lt.find(slot as u32) as usize;
                     if r != slot {
-                        let name = lt.slots[r][1].load(Ordering::Relaxed);
-                        lt.slots[slot][1].store(name, Ordering::Relaxed);
+                        lt.parent[slot].store(r as u32 + 1, Ordering::Relaxed);
                     }
                 }
             });
@@ -895,7 +900,7 @@ fn main() {
                                 if i + 32 < src.len() {
                                     lt.prefetch(src[i + 32].ukey);
                                 }
-                                let person = lt.get(c.ukey).unwrap_or(c.ukey);
+                                let person = match lt.get(c.ukey) { Some(r) => LINKTAG | r as u64, None => c.ukey };
                                 outc.push_r(&mut arena, &mut free, pbucket(person), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                             }
                             }
@@ -955,7 +960,7 @@ fn main() {
                                 lt.prefetch(buf[surv[x + 32] as usize].ukey);
                             }
                             let r = &buf[i as usize];
-                            let person = lt.get(r.ukey).unwrap_or(r.ukey);
+                            let person = match lt.get(r.ukey) { Some(rt) => LINKTAG | rt as u64, None => r.ukey };
                             out.push_r(
                                 &mut arena,
                                 &mut free,
@@ -1254,6 +1259,7 @@ fn main() {
             let ukeys = &ukeys;
             let cats = &cats;
             let ud_dir = &ud_dir;
+            let lt = &lt;
             s.spawn(move || {
                 let rows = &o.rows;
                 let n = rows.len();
@@ -1263,7 +1269,8 @@ fn main() {
                 let mut defined = vec![0u8; n.div_ceil(8) + 1];
                 for (r_i, r) in rows.iter().enumerate() {
                     tmp.clear();
-                    ukeys.bytes(r.person, &mut tmp);
+                    let pk = if r.person & LINKTAG == LINKTAG { lt.name((r.person & 0xFFFF_FFFF) as u32) } else { r.person };
+                    ukeys.bytes(pk, &mut tmp);
                     uid.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
                     uid.extend_from_slice(&tmp);
                     if r.top >= 0 {
