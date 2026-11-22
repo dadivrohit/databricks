@@ -100,35 +100,41 @@ impl U64Map {
     }
 }
 
-/// Strings that do not fit the compact key form. Each distinct string is stored once in an
-/// append-only arena and its key is EXOTIC | its offset there, so the key gives back the
-/// bytes with no lookup. Finding a string's key is a lock-free insert-only hash table
-/// (the hidden practice data sends millions of IDs this way; a lock would serialize them).
+/// Strings that do not fit the compact key form (the hidden practice data's user IDs are
+/// 23+ characters, millions of them). Such a string's key is EXOTIC | a 62-bit hash of its
+/// bytes, so finding the key costs one probe of a lock-free insert-only table (no lock, no
+/// byte compare); the first thread to see a string stores its bytes for the output and for
+/// ordering. (Two different IDs sharing a 62-bit hash: odds about n^2 / 2^63, ~1e-6 at 6M.)
 struct Interner {
-    slots: &'static [AtomicU64], // 0 = empty, else fingerprint << 40 | (offset + 1)
+    slots: &'static [AtomicU64], // key, 0 = empty
+    offs: &'static [AtomicU64],  // arena offset + 1 of the key's bytes
     mask: usize,
     arena: *mut u8,
     arena_cap: usize,
     bump: AtomicUsize,
     used: AtomicUsize,
+    /// once the table is 80% full (more distinct IDs than expected), the rest go here
+    overflow: Mutex<HashMap<u64, Box<[u8]>>>,
 }
 unsafe impl Sync for Interner {}
 unsafe impl Send for Interner {}
 
 #[inline(always)]
 fn byte_hash(b: &[u8]) -> u64 {
-    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ b.len() as u64;
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (b.len() as u64).wrapping_mul(0xA076_1D64_78BD_642F);
     let mut c = b.chunks_exact(8);
     for w in &mut c {
-        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        h ^= h >> 29;
+        let x = u64::from_le_bytes(w.try_into().unwrap());
+        h = (h ^ x).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(23) ^ x.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
     }
     let mut t = 0u64;
     for (i, &x) in c.remainder().iter().enumerate() {
         t |= (x as u64) << (8 * i);
     }
-    h = (h ^ t).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
-    h ^ (h >> 32)
+    h = (h ^ t).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^ (h >> 33)
 }
 
 fn reserve(bytes: usize) -> *mut u8 {
@@ -141,12 +147,27 @@ fn reserve(bytes: usize) -> *mut u8 {
 
 impl Interner {
     /// `max_strings`: an upper bound on how many strings could arrive (occurrences, not
-    /// distinct); `max_bytes`: an upper bound on their total size. Untouched memory costs nothing.
-    fn new(max_strings: usize, max_bytes: usize) -> Self {
-        let cap = (max_strings.max(1 << 12) + max_strings / 4).next_power_of_two();
+    /// distinct); `max_bytes`: on their total size. Untouched memory costs nothing.
+    fn new(max_strings: usize, max_bytes: usize, expect_per_distinct: usize) -> Self {
+        // sized for the expected distinct count; more than that spills to `overflow`
+        let cap = if std::env::var_os("TINYINT").is_some() {
+            1 << 16
+        } else {
+            (max_strings / expect_per_distinct * 5 / 4).max(1 << 16).next_power_of_two()
+        };
         let slots: &'static [AtomicU64] = unsafe { std::slice::from_raw_parts(reserve(cap * 8) as *const AtomicU64, cap) };
+        let offs: &'static [AtomicU64] = unsafe { std::slice::from_raw_parts(reserve(cap * 8) as *const AtomicU64, cap) };
         let arena_cap = max_bytes + 3 * max_strings + (1 << 20);
-        Interner { slots, mask: cap - 1, arena: reserve(arena_cap), arena_cap, bump: AtomicUsize::new(0), used: AtomicUsize::new(0) }
+        Interner {
+            slots,
+            offs,
+            mask: cap - 1,
+            arena: reserve(arena_cap),
+            arena_cap,
+            bump: AtomicUsize::new(0),
+            used: AtomicUsize::new(0),
+            overflow: Mutex::new(HashMap::new()),
+        }
     }
     #[inline(always)]
     fn rec(&self, off: usize) -> &[u8] {
@@ -156,44 +177,68 @@ impl Interner {
             std::slice::from_raw_parts(p.add(2), n)
         }
     }
-    #[cold]
+    #[inline(always)]
     fn intern(&self, s: &[u8]) -> u64 {
-        assert!(s.len() < 65536, "ID too long");
-        let h = byte_hash(s);
-        let fp = h >> 40;
-        let mut i = (h as usize) & self.mask;
+        let key = EXOTIC | (byte_hash(s) >> 2);
+        let mut i = (key as usize) & self.mask;
         loop {
             let slot = unsafe { self.slots.get_unchecked(i) };
-            let mut cur = slot.load(Ordering::Acquire);
-            if cur == 0 {
-                let off = self.bump.fetch_add(2 + s.len(), Ordering::Relaxed);
-                assert!(off + 2 + s.len() <= self.arena_cap, "interner arena full");
-                unsafe {
-                    let p = self.arena.add(off);
-                    std::ptr::copy_nonoverlapping((s.len() as u16).to_le_bytes().as_ptr(), p, 2);
-                    std::ptr::copy_nonoverlapping(s.as_ptr(), p.add(2), s.len());
-                }
-                let new = (fp << 40) | (off as u64 + 1);
-                match slot.compare_exchange(0, new, Ordering::Release, Ordering::Acquire) {
-                    Ok(_) => {
-                        let u = self.used.fetch_add(1, Ordering::Relaxed);
-                        assert!(u * 10 < self.mask * 9, "interner table full");
-                        return EXOTIC | off as u64;
-                    }
-                    Err(now) => cur = now, // someone took the slot: it may be this very string
-                }
+            let cur = slot.load(Ordering::Relaxed);
+            if cur == key {
+                return key;
             }
-            if cur >> 40 == fp {
-                let off = ((cur & ((1 << 40) - 1)) - 1) as usize;
-                if self.rec(off) == s {
-                    return EXOTIC | off as u64;
+            if cur == 0 {
+                if self.used.load(Ordering::Relaxed) * 5 >= self.mask * 4 {
+                    // full enough: keep the bytes on the side (a key is its hash either way)
+                    self.overflow.lock().unwrap().entry(key).or_insert_with(|| s.into());
+                    return key;
+                }
+                match slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        self.store(i, s);
+                        return key;
+                    }
+                    Err(now) if now == key => return key,
+                    Err(_) => {}
                 }
             }
             i = (i + 1) & self.mask;
         }
     }
+    #[cold]
+    fn store(&self, i: usize, s: &[u8]) {
+        assert!(s.len() < 65536, "ID too long");
+        let off = self.bump.fetch_add(2 + s.len(), Ordering::Relaxed);
+        assert!(off + 2 + s.len() <= self.arena_cap, "interner arena full");
+        unsafe {
+            let p = self.arena.add(off);
+            std::ptr::copy_nonoverlapping((s.len() as u16).to_le_bytes().as_ptr(), p, 2);
+            std::ptr::copy_nonoverlapping(s.as_ptr(), p.add(2), s.len());
+        }
+        self.offs[i].store(off as u64 + 1, Ordering::Release);
+        self.used.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Bytes of a key (all inserts done).
+    fn bytes_of(&self, key: u64) -> &[u8] {
+        let mut i = (key as usize) & self.mask;
+        loop {
+            let cur = self.slots[i].load(Ordering::Relaxed);
+            if cur == 0 {
+                let g = self.overflow.lock().unwrap();
+                let b: &[u8] = g.get(&key).expect("unknown key");
+                // boxed bytes never move or drop while the interner lives
+                return unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) };
+            }
+            if cur == key {
+                let o = self.offs[i].load(Ordering::Acquire);
+                assert!(o != 0, "key bytes missing");
+                return self.rec(o as usize - 1);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
     fn len(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        self.used.load(Ordering::Relaxed) + self.overflow.lock().unwrap().len()
     }
 }
 
@@ -211,7 +256,7 @@ struct Keys<'a> {
 impl Keys<'_> {
     fn bytes(&self, k: u64, out: &mut Vec<u8>) {
         if k & EXOTIC != 0 {
-            out.extend_from_slice(self.exotic.rec((k & !EXOTIC) as usize));
+            out.extend_from_slice(self.exotic.bytes_of(k));
         } else {
             unpack_short(k, self.prefix, out);
         }
@@ -226,7 +271,7 @@ impl Keys<'_> {
     #[cold]
     fn cmp_slow(&self, a: u64, b: u64) -> std::cmp::Ordering {
         if a & b & EXOTIC != 0 {
-            return self.exotic.rec((a & !EXOTIC) as usize).cmp(self.exotic.rec((b & !EXOTIC) as usize));
+            return self.exotic.bytes_of(a).cmp(self.exotic.bytes_of(b));
         }
         let mut x = Vec::new();
         let mut y = Vec::new();
@@ -658,9 +703,7 @@ fn main() {
         .parse()
         .ok()
         .filter(|&n| n > 0)
-        // At most 4 threads: the scorer's 8 CPUs are 4 cores' hyperthreads on a shared host,
-        // where 8 threads cost ~70% more CPU time (and far more kernel time) for little speed.
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(4));
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
     let timing = std::env::var("TIMING").is_ok();
     let laps: std::cell::RefCell<Vec<f64>> = std::cell::RefCell::new(Vec::new());
     let lap = |what: &str| {
@@ -781,9 +824,9 @@ fn main() {
     // upper bounds on ID occurrences (a data line is well over 30 bytes; link lines 8+)
     let kind_bytes = |k: u8| -> usize { files.iter().filter(|f| f.1 == k).map(|f| f.0.len).sum() };
     let (eb, cb, lb) = (kind_bytes(0), kind_bytes(1), kind_bytes(2));
-    let users = Interner::new((eb + cb) / 30 + lb / 4, eb + cb + lb);
-    let ekeys = Interner::new(eb / 30, eb);
-    let ckeys = Interner::new(cb / 30, cb);
+    let users = Interner::new((eb + cb) / 30 + lb / 4, eb + cb + lb, 8); // a person has many events
+    let ekeys = Interner::new(eb / 30, eb, 1);
+    let ckeys = Interner::new(cb / 30, cb, 1);
 
     // ---- parse everything; the last link chunk's thread runs union-find meanwhile
     let total_event_bytes: usize = files.iter().filter(|f| f.1 == 0).map(|f| f.0.len).sum();
@@ -948,7 +991,7 @@ fn main() {
     // ---- name each person (smallest ID) and point every linked ID at that name
     std::thread::scope(|s| {
         for tid in 0..nthreads {
-            let (lt, barrier, exotic_slots, users) = (&lt, &barrier, &exotic_slots, &users);
+            let (lt, barrier, users) = (&lt, &barrier, &users);
             s.spawn(move || {
                 let cap = lt.len;
                 let (r0, r1) = (cap * tid / nthreads, cap * (tid + 1) / nthreads);
@@ -965,20 +1008,20 @@ fn main() {
                         lt.names[r].fetch_max(!k, Ordering::Relaxed);
                     }
                 }
-                if !exo.is_empty() {
-                    exotic_slots.lock().unwrap().extend(exo);
-                }
                 barrier.wait();
-                if tid == 0 {
-                    let ex = std::mem::take(&mut *exotic_slots.lock().unwrap());
-                    if !ex.is_empty() {
-                        let uk = Keys { prefix: b'u', exotic: &users };
-                        for slot in ex {
-                            let k = lt.keys[slot as usize].load(Ordering::Relaxed);
-                            let r = lt.find(slot) as usize;
-                            let cur = !lt.names[r].load(Ordering::Relaxed);
-                            if cur == u64::MAX || uk.cmp(k, cur) == std::cmp::Ordering::Less {
-                                lt.names[r].store(!k, Ordering::Relaxed);
+                // IDs without a compact key compare by their bytes: lock-free, each thread its own
+                if !exo.is_empty() {
+                    let uk = Keys { prefix: b'u', exotic: &users };
+                    for slot in exo {
+                        let k = lt.keys[slot as usize].load(Ordering::Relaxed);
+                        let r = lt.find(slot) as usize;
+                        loop {
+                            let raw = lt.names[r].load(Ordering::Relaxed);
+                            if raw != 0 && uk.cmp(k, !raw) != std::cmp::Ordering::Less {
+                                break;
+                            }
+                            if lt.names[r].compare_exchange(raw, !k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                break;
                             }
                         }
                     }
