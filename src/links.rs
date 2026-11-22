@@ -130,6 +130,33 @@ impl LinkTable {
         }
     }
 
+    /// person() with mix(k) already known.
+    #[inline(always)]
+    pub fn person_h(&self, k: u64, h: u64, tag: u64) -> u64 {
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let cur = unsafe { self.keys.get_unchecked(i) }.load(Relaxed);
+            if cur == k {
+                let p = unsafe { self.parent.get_unchecked(i) }.load(Relaxed);
+                return tag | (if p == 0 { i as u32 } else { p - 1 }) as u64;
+            }
+            if cur == 0 {
+                return k;
+            }
+            i += 1;
+        }
+    }
+
+    /// prefetch() with mix(k) already known.
+    #[inline(always)]
+    pub fn prefetch_h(&self, h: u64) {
+        let i = (h as usize) & self.mask;
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(self.keys.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(self.parent.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0)
+        };
+    }
+
     /// key -> person id (tag | root slot) for a linked key, else the key itself.
     #[inline(always)]
     pub fn person(&self, k: u64, tag: u64) -> u64 {

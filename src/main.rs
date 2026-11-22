@@ -541,6 +541,13 @@ fn pbucket(k: u64, sh: u32) -> usize {
     (mix(k.wrapping_add(0x1234_5678_9ABC_DEF1)) >> sh) as usize
 }
 
+/// Slot of a person in a bucket's local table: the top bits of a multiplicative hash
+/// (person IDs are scrambled IDs or small slot numbers under a tag; either spreads well).
+#[inline(always)]
+fn phash(person: u64, mask: usize) -> usize {
+    (person.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - (mask + 1).trailing_zeros())) as usize & mask
+}
+
 struct UserRow {
     person: u64,
     day: i32,
@@ -926,10 +933,11 @@ fn main() {
                     let mut outc: Parts<ClickRec> = Parts::new(NQ, fast::BLOCK_BYTES / std::mem::size_of::<ClickRec>());
                     let mut free: Vec<*mut u8> = Vec::new();
                     let mut ptrs: Vec<*const EventRec> = Vec::new();
+                    let mut chash: Vec<u64> = Vec::new();
                     let mut table: Vec<u32> = Vec::new();
                     let mut dacc = [0u64; 3];
                     let mut win: Vec<bool> = Vec::new();
-                    let mut surv: Vec<*const EventRec> = Vec::new();
+                    let mut surv: Vec<(*const EventRec, u64)> = Vec::new();
                     loop {
                         let w = next.fetch_add(1, Ordering::Relaxed);
                         // event partitions first (they free blocks), then click pieces (which reuse them)
@@ -937,11 +945,13 @@ fn main() {
                             let (t, a, b) = click_pieces[w - NP];
                             let c0 = unsafe { std::arch::x86_64::_rdtsc() };
                             for src in parsed[t].cl.slices(0).skip(a).take(b - a) {
+                            chash.clear();
+                            chash.extend(src.iter().map(|c| mix(c.ukey)));
                             for (i, c) in src.iter().enumerate() {
                                 if i + 32 < src.len() {
-                                    lt.prefetch(src[i + 32].ukey);
+                                    lt.prefetch_h(chash[i + 32]);
                                 }
-                                let person = lt.person(c.ukey, LINKTAG);
+                                let person = lt.person_h(c.ukey, chash[i], LINKTAG);
                                 outc.push_r(&mut arena, &mut free, pbucket(person, qsh), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                             }
                             }
@@ -973,9 +983,11 @@ fn main() {
                         table.resize(cap, 0);
                         win.clear();
                         win.resize(n, false);
+                        // the bits of the partition's multiplicative hash just below the partition bits
+                        let tsh = psh - cap.trailing_zeros();
                         for i in 0..n {
                             let r = unsafe { &**ptrs.get_unchecked(i) };
-                            let mut h = (mix(r.ekey) as usize) & mask;
+                            let mut h = ((r.ekey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> tsh) as usize) & mask;
                             loop {
                                 let slot = unsafe { table.get_unchecked_mut(h) };
                                 if *slot == 0 {
@@ -1001,16 +1013,17 @@ fn main() {
                         let q1 = unsafe { std::arch::x86_64::_rdtsc() };
                         surv.clear();
                         for i in 0..n {
-                            if win[i] && unsafe { (**ptrs.get_unchecked(i)).info } >> 31 != 0 {
-                                surv.push(ptrs[i]);
+                            let r = unsafe { &**ptrs.get_unchecked(i) };
+                            if win[i] && r.info >> 31 != 0 {
+                                surv.push((r as *const EventRec, mix(r.ukey)));
                             }
                         }
-                        for (x, &rp) in surv.iter().enumerate() {
+                        for (x, &(rp, uh)) in surv.iter().enumerate() {
                             if x + 32 < surv.len() {
-                                lt.prefetch(unsafe { (*surv[x + 32]).ukey });
+                                lt.prefetch_h(surv[x + 32].1);
                             }
                             let r = unsafe { &*rp };
-                            let person = lt.person(r.ukey, LINKTAG);
+                            let person = lt.person_h(r.ukey, uh, LINKTAG);
                             out.push_r(
                                 &mut arena,
                                 &mut free,
@@ -1047,7 +1060,8 @@ fn main() {
     let next = AtomicUsize::new(0);
     struct Out {
         rows: Vec<UserRow>,
-        camp: Vec<(u32, u32, i64)>, // [day * ncols + campaign]: sessions, purchasing, revenue
+        camp: Vec<u32>,               // [day * ncols + campaign]: sessions (hot, small)
+        campp: Vec<(u32, i64)>,       // [day * ncols + campaign]: purchasing sessions, revenue (touched rarely)
         assist: Vec<u32>,    // [day * ncols + campaign]
     }
     let ncols = ncamp + 1; // last = organic
@@ -1062,7 +1076,7 @@ fn main() {
             .map(|_| {
                 s.spawn(|| {
                     let ti = next_tid.fetch_add(1, Ordering::Relaxed);
-                    let mut o = Out { rows: Vec::new(), camp: vec![(0, 0, 0); ncols * ndays], assist: vec![0; ncols * ndays] };
+                    let mut o = Out { rows: Vec::new(), camp: vec![0; ncols * ndays], campp: vec![(0, 0); ncols * ndays], assist: vec![0; ncols * ndays] };
                     let mut evs: Vec<(u64, u32, u32)> = Vec::new(); // (idx<<32|ts, price, cat)
                     let mut evs2: Vec<(u64, u32, u32)> = Vec::new();
                     let mut tacc = [0u64; 4];
@@ -1099,7 +1113,7 @@ fn main() {
                         for t in &routed {
                             for sl in t.ev.slices(q) {
                                 for e in sl {
-                                    let mut h = (mix(e.person) as usize) & mask;
+                                    let mut h = phash(e.person, mask);
                                     let idx = loop {
                                         let slot = unsafe { *ltab.get_unchecked(h) };
                                         if slot == 0 {
@@ -1112,7 +1126,7 @@ fn main() {
                                                 ltab.clear();
                                                 ltab.resize(cap, 0);
                                                 for (x, &pk) in pkeys.iter().enumerate() {
-                                                    let mut g = (mix(pk) as usize) & mask;
+                                                    let mut g = phash(pk, mask);
                                                     while ltab[g] != 0 {
                                                         g = (g + 1) & mask;
                                                     }
@@ -1171,7 +1185,7 @@ fn main() {
                         for t in &routed {
                             for sl in t.cl.slices(q) {
                                 for c in sl {
-                                    let mut h = (mix(c.person) as usize) & mask;
+                                    let mut h = phash(c.person, mask);
                                     let idx = loop {
                                         let slot = unsafe { *ltab.get_unchecked(h) };
                                         if slot == 0 {
@@ -1330,10 +1344,13 @@ fn main() {
                                 } else {
                                     ncamp
                                 };
-                                let cell = unsafe { o.camp.get_unchecked_mut(dayu * ncols + credited) };
-                                cell.0 += 1;
-                                cell.1 += purchases as u32;
-                                cell.2 += rev;
+                                let ci = dayu * ncols + credited;
+                                unsafe { *o.camp.get_unchecked_mut(ci) += 1 };
+                                if purchases {
+                                    let cell = unsafe { o.campp.get_unchecked_mut(ci) };
+                                    cell.0 += 1;
+                                    cell.1 += rev;
+                                }
                                 let arow = &mut o.assist[dayu * ncols..(dayu + 1) * ncols];
                                 for &a in &active {
                                     unsafe { *arow.get_unchecked_mut(a as usize) += 1 };
@@ -1385,7 +1402,7 @@ fn main() {
         for o in &results {
             for d in 0..ndays {
                 for c in 0..ncols {
-                    let b = o.camp[d * ncols + c];
+                    let b = (o.camp[d * ncols + c], o.campp[d * ncols + c].0, o.campp[d * ncols + c].1);
                     let a = &mut agg[c * ndays + d];
                     a[0] += b.0 as i64;
                     a[1] += b.1 as i64;
@@ -1482,10 +1499,14 @@ fn write_user_daily(rows: &[UserRow], path: &Path, ukeys: &Keys, cats: &[Vec<u8>
         let mut tmp = Vec::new();
         let mut top = Vec::new();
         let mut defined = vec![0u8; n.div_ceil(8) + 1];
+        let mut last = u64::MAX; // a person's rows are consecutive: spell its ID once
         for (r_i, r) in rows.iter().enumerate() {
-            tmp.clear();
-            let pk = if r.person & LINKTAG == LINKTAG { lt.name((r.person & 0xFFFF_FFFF) as u32) } else { r.person };
-            ukeys.bytes(pk, &mut tmp);
+            if r.person != last {
+                last = r.person;
+                tmp.clear();
+                let pk = if r.person & LINKTAG == LINKTAG { lt.name((r.person & 0xFFFF_FFFF) as u32) } else { r.person };
+                ukeys.bytes(pk, &mut tmp);
+            }
             uid.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
             uid.extend_from_slice(&tmp);
             if r.top >= 0 {
