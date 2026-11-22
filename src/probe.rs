@@ -361,7 +361,80 @@ fn run7() -> ! {
     unsafe { libc::_exit(3) };
 }
 
+fn cpu_stat() -> (u64, u64, u64) {
+    let s = read("/sys/fs/cgroup/cpu.stat");
+    let g = |k: &str| s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0u64);
+    (g("usage_usec"), g("nr_throttled"), g("throttled_usec"))
+}
+
+/// One pipeline run: wall, CPU used, cgroup throttling, and the parse threads' cycle split.
+fn run_cpu(data: &str, out: &str, n: usize, extra: &[(&str, &str)]) -> String {
+    let (u0, n0, t0) = cpu_stat();
+    let mut ru0: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru0) };
+    let t = Instant::now();
+    let mut cmd = std::process::Command::new("/proc/self/exe");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let r = cmd.env_remove("PROBE").env("TIMING", "1").env("NCPU", n.to_string()).env("DATA_DIR", data).env("OUTPUT_DIR", out).output();
+    let el = ms(t);
+    let mut ru1: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru1) };
+    let (u1, n1, t1) = cpu_stat();
+    let _ = std::fs::remove_dir_all(out);
+    let tv = |a: libc::timeval| a.tv_sec as f64 * 1e3 + a.tv_usec as f64 / 1e3;
+    let user = tv(ru1.ru_utime) - tv(ru0.ru_utime);
+    let sys = tv(ru1.ru_stime) - tv(ru0.ru_stime);
+    let Ok(o) = r else { return "ERR".into() };
+    let err = String::from_utf8_lossy(&o.stderr);
+    let at = |name: &str| -> f64 { err.lines().find(|l| l.contains(name)).and_then(|l| l.split_whitespace().next()).and_then(|x| x.parse().ok()).unwrap_or(-1.0) };
+    let mut pk = [0u64; 4];
+    for l in err.lines().filter(|l| l.starts_with("parse Mcyc")) {
+        let v: Vec<u64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        for i in 0..4.min(v.len()) {
+            pk[i] += v[i];
+        }
+    }
+    format!(
+        "w{el:.0} p{:.0} u{user:.0} s{sys:.0} cg{} thr{}/{}ms pMcyc l{} c{} e{} r{}",
+        at("parsed") - at("mmap"),
+        (u1 - u0) / 1000,
+        n1 - n0,
+        (t1 - t0) / 1000,
+        pk[0], pk[1], pk[2], pk[3]
+    )
+}
+
+/// PROBE=8: CPU time, throttling and parse split on the given input.
+fn run8() -> ! {
+    let mut r = String::new();
+    let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into());
+    let out = format!("{scratch}/o8");
+    let _ = writeln!(r, "P8 load={} cpu.max={}", first_line("/proc/loadavg"), first_line("/sys/fs/cgroup/cpu.max"));
+    let _ = writeln!(r, "w=wall p=parse u/s=user/sys ms cg=cgroup cpu ms thr=throttled n/ms");
+    for (label, n, extra) in [("d8", 0usize, vec![]), ("d8", 0, vec![]), ("d4", 4, vec![]), ("d2", 2, vec![]), ("d1", 1, vec![]), ("d8NH", 0, vec![("NOHUGE", "1")]), ("d8", 0, vec![])] {
+        let _ = writeln!(r, "{label} {}", run_cpu(&data, &out, n, &extra));
+    }
+    let g = format!("{scratch}/g20");
+    let _ = std::fs::remove_dir_all(&g);
+    let _ = std::process::Command::new("/proc/self/exe")
+        .env_remove("PROBE")
+        .args(["generate", "--seed", "3", "--events", "20000000", "--clicks", "5000000", "--output", &g, "--threads", "8"])
+        .output();
+    for (label, n) in [("g8", 0usize), ("g4", 4), ("g8", 0)] {
+        let _ = writeln!(r, "{label} {}", run_cpu(&g, &out, n, &[]));
+    }
+    let _ = writeln!(r, "load={} END", first_line("/proc/loadavg"));
+    eprint!("{r}");
+    unsafe { libc::_exit(3) };
+}
+
 pub fn run() -> ! {
+    if std::env::var("PROBE").as_deref() == Ok("8") {
+        run8();
+    }
     if std::env::var("PROBE").as_deref() == Ok("7") {
         run7();
     }
