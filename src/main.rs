@@ -178,8 +178,30 @@ impl Interner {
         }
     }
     #[inline(always)]
+    fn key(s: &[u8]) -> u64 {
+        EXOTIC | (byte_hash(s) >> 2)
+    }
+    #[inline(always)]
     fn intern(&self, s: &[u8]) -> u64 {
-        let key = EXOTIC | (byte_hash(s) >> 2);
+        self.intern_key(Self::key(s), s)
+    }
+    /// Makes sure the table holds the bytes of each pending (key, offset, len) in `pb`:
+    /// a batch with the table slots prefetched ahead, so the misses overlap.
+    fn flush(&self, pend: &mut Vec<(u64, u32, u32)>, pb: &mut Vec<u8>) {
+        const AHEAD: usize = 16;
+        for j in 0..pend.len() {
+            if j + AHEAD < pend.len() {
+                let i = (pend[j + AHEAD].0 as usize) & self.mask;
+                unsafe { std::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+            }
+            let (key, o, n) = pend[j];
+            self.intern_key(key, &pb[o as usize..(o + n) as usize]);
+        }
+        pend.clear();
+        pb.clear();
+    }
+    #[inline(always)]
+    fn intern_key(&self, key: u64, s: &[u8]) -> u64 {
         let mut i = (key as usize) & self.mask;
         loop {
             let slot = unsafe { self.slots.get_unchecked(i) };
@@ -240,6 +262,20 @@ impl Interner {
     fn len(&self) -> usize {
         self.used.load(Ordering::Relaxed) + self.overflow.lock().unwrap().len()
     }
+}
+
+/// key_of() that leaves the table work for a later Interner::flush (copying the bytes).
+#[inline(always)]
+unsafe fn key_of_later(p: *const u8, n: usize, prefix: u8, pend: &mut Vec<(u64, u32, u32)>, pb: &mut Vec<u8>) -> u64 {
+    let k = unsafe { short_key(p, n, prefix) };
+    if k != 0 {
+        return k;
+    }
+    let s = unsafe { std::slice::from_raw_parts(p, n) };
+    let key = Interner::key(s);
+    pend.push((key, pb.len() as u32, n as u32));
+    pb.extend_from_slice(s);
+    key
 }
 
 #[inline(always)]
@@ -852,6 +888,8 @@ fn main() {
                     // ---- links: insert keys and union them right away (lock-free); naming happens after parsing
                     let mut sc = Scanner::new();
                     let mut rd = ChunkReader::new();
+                    let mut upend: Vec<(u64, u32, u32)> = Vec::new();
+                    let mut ubytes: Vec<u8> = Vec::new();
                     let mut kpairs: Vec<(u64, u64)> = Vec::new();
                     let mut pacc = [0u64; 4];
                     let pl0 = unsafe { std::arch::x86_64::_rdtsc() };
@@ -867,10 +905,13 @@ fn main() {
                             if a.0 == a.1 || b.0 == b.1 {
                                 return;
                             }
-                            let ka = key_of(p.add(a.0), a.1 - a.0, b'u', users);
-                            let kb = key_of(p.add(b.0), b.1 - b.0, b'u', users);
+                            let ka = key_of_later(p.add(a.0), a.1 - a.0, b'u', &mut upend, &mut ubytes);
+                            let kb = key_of_later(p.add(b.0), b.1 - b.0, b'u', &mut upend, &mut ubytes);
                             kpairs.push((ka, kb));
                         });
+                        if !upend.is_empty() {
+                            users.flush(&mut upend, &mut ubytes);
+                        }
                         for i in 0..kpairs.len() {
                             if i + 12 < kpairs.len() {
                                 lt.prefetch(kpairs[i + 12].0);
@@ -919,7 +960,7 @@ fn main() {
                                         return;
                                     };
                                     let ckey = key_of(p.add(fc.0), fc.1 - fc.0, b'k', &ckeys);
-                                    let ukey = key_of(p.add(fu.0), fu.1 - fu.0, b'u', users);
+                                    let ukey = key_of_later(p.add(fu.0), fu.1 - fu.0, b'u', &mut upend, &mut ubytes);
                                     cl.push(&mut arena, 0, ClickRaw { ukey, ckey, ts: (t - ws) as i32, camp });
                                 });
                             }
@@ -935,7 +976,7 @@ fn main() {
                                     let ingest = (ingest_s - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                                     let f1 = f[1];
                                     let mut valid = f1.0 != f1.1;
-                                    let ukey = if valid { key_of(p.add(f1.0), f1.1 - f1.0, b'u', users) } else { 0 };
+                                    let ukey = if valid { key_of_later(p.add(f1.0), f1.1 - f1.0, b'u', &mut upend, &mut ubytes) } else { 0 };
                                     let f2 = f[2];
                                     let mut tsr = 0u32;
                                     match ts.ms(p.add(f2.0), f2.1 - f2.0) {
@@ -972,6 +1013,9 @@ fn main() {
                                     ev.push(&mut arena, epart(ekey, psh), EventRec { ekey, ukey, ingest, ts: tsr, info, price });
                                 });
                             }
+                        }
+                        if !upend.is_empty() {
+                            users.flush(&mut upend, &mut ubytes);
                         }
                         pacc[if kind == 1 { 1 } else { 2 }] += unsafe { std::arch::x86_64::_rdtsc() } - pc1;
                     }
