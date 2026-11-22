@@ -597,6 +597,8 @@ fn main() {
     let we = grab("\"window_end\"");
     let first_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - first_day + 1).max(1) as usize;
+    // window start's offset into its UTC day (>= 0): a session's day is (ws_in_day + start) / DAY
+    let ws_in_day = (ws - first_day * DAY) as u64;
     let ws_s = ws.div_euclid(1000);
 
     // products & categories (allocation-free per row)
@@ -920,7 +922,6 @@ fn main() {
                     let mut free: Vec<*mut u8> = Vec::new();
                     let mut ptrs: Vec<*const EventRec> = Vec::new();
                     let mut table: Vec<u32> = Vec::new();
-                    let mut tkeys: Vec<u64> = Vec::new();
                     let mut dacc = [0u64; 3];
                     let mut win: Vec<bool> = Vec::new();
                     let mut surv: Vec<*const EventRec> = Vec::new();
@@ -963,9 +964,6 @@ fn main() {
                         }
                         let cap = (n * 2).next_power_of_two();
                         let mask = cap - 1;
-                        // keys in the table itself (0 = empty; event keys are never 0)
-                        tkeys.clear();
-                        tkeys.resize(cap, 0);
                         table.clear();
                         table.resize(cap, 0);
                         win.clear();
@@ -974,24 +972,21 @@ fn main() {
                             let r = unsafe { &**ptrs.get_unchecked(i) };
                             let mut h = (mix(r.ekey) as usize) & mask;
                             loop {
-                                let k = unsafe { *tkeys.get_unchecked(h) };
-                                if k == 0 {
-                                    unsafe {
-                                        *tkeys.get_unchecked_mut(h) = r.ekey;
-                                        *table.get_unchecked_mut(h) = i as u32;
-                                        *win.get_unchecked_mut(i) = true;
-                                    }
+                                let slot = unsafe { table.get_unchecked_mut(h) };
+                                if *slot == 0 {
+                                    *slot = i as u32 + 1;
+                                    unsafe { *win.get_unchecked_mut(i) = true };
                                     break;
                                 }
-                                if k == r.ekey {
-                                    let j = unsafe { *table.get_unchecked(h) } as usize;
-                                    let rj = unsafe { &**ptrs.get_unchecked(j) };
+                                let j = (*slot - 1) as usize;
+                                let rj = unsafe { &**ptrs.get_unchecked(j) };
+                                if rj.ekey == r.ekey {
                                     if r.ingest < rj.ingest {
                                         unsafe {
                                             *win.get_unchecked_mut(j) = false;
                                             *win.get_unchecked_mut(i) = true;
-                                            *table.get_unchecked_mut(h) = i as u32;
                                         }
+                                        *slot = i as u32 + 1;
                                     }
                                     break;
                                 }
@@ -1061,6 +1056,10 @@ fn main() {
                     let mut tacc = [0u64; 4];
                     let tstart = unsafe { std::arch::x86_64::_rdtsc() };
                     let mut pcnt: Vec<u32> = Vec::new();
+                    let mut ccnt: Vec<u32> = Vec::new();
+                    let mut cfill: Vec<u32> = Vec::new();
+                    let mut cgrp: Vec<(u32, u32)> = Vec::new();
+                    let mut cls2: Vec<(u64, u64, u32)> = Vec::new();
                     let mut cls: Vec<(u64, u64, u32)> = Vec::new(); // (idx<<32|ts', ckey, camp)
                     let mut pkeys: Vec<u64> = Vec::new();
                     let mut ltab: Vec<u32> = Vec::new();
@@ -1126,31 +1125,20 @@ fn main() {
                                     *c += 1;
                                 }
                             }
-                            std::mem::swap(&mut evs, &mut evs2);
                             tacc[3] += unsafe { std::arch::x86_64::_rdtsc() } - t1;
+                            // sort each person's group from evs2 back into evs
                             let mut s0 = 0usize;
                             for &end in pcnt.iter() {
-                                let g = &mut evs[s0..end as usize];
-                                if g.len() <= 16 {
-                                    if g.len() > 1 {
-                                        unsafe { rank_sort16(g) };
-                                    }
-                                } else if g.len() <= 24 {
-                                    for a in 1..g.len() {
-                                        let x = g[a];
-                                        let mut b = a;
-                                        while b > 0 && g[b - 1].0 > x.0 {
-                                            g[b] = g[b - 1];
-                                            b -= 1;
-                                        }
-                                        g[b] = x;
-                                    }
+                                let e = end as usize;
+                                let n = e - s0;
+                                if n <= 32 {
+                                    unsafe { rank_sort32_into(evs2.as_ptr().add(s0), evs.as_mut_ptr().add(s0), n) };
                                 } else {
-                                    g.sort_unstable_by_key(|e| e.0);
+                                    evs[s0..e].copy_from_slice(&evs2[s0..e]);
+                                    evs[s0..e].sort_unstable_by_key(|e| e.0);
                                 }
-                                s0 = end as usize;
+                                s0 = e;
                             }
-                            pcnt.clear();
                         }
                         let t2 = unsafe { std::arch::x86_64::_rdtsc() };
                         cls.clear();
@@ -1175,33 +1163,75 @@ fn main() {
                                 }
                             }
                         }
-                        let exotic_ck = cls.iter().any(|c| c.1 & EXOTIC != 0);
-                        if exotic_ck {
-                            cls.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| ckeys_k.cmp(a.1, b.1)));
-                        } else {
-                            // short click keys compare as numbers: (idx<<32|ts, ckey) is the order
-                            cls.sort_unstable_by_key(|c| ((c.0 as u128) << 64) | c.1 as u128);
+                        // group clicks by person too (counting sort), then sort and dedup each group
+                        let np = pkeys.len();
+                        ccnt.clear();
+                        ccnt.resize(np + 1, 0);
+                        for c in cls.iter() {
+                            unsafe { *ccnt.get_unchecked_mut((c.0 >> 32) as usize + 1) += 1 };
                         }
-                        cls.dedup_by(|b, a| a.0 == b.0 && a.1 == b.1);
+                        for x in 1..=np {
+                            ccnt[x] += ccnt[x - 1];
+                        }
+                        cls2.clear();
+                        cls2.reserve(cls.len());
+                        unsafe {
+                            cls2.set_len(cls.len());
+                            let d = cls2.as_mut_ptr();
+                            // ccnt[x] is group x's start; bump a copy as the fill cursor
+                            cfill.clear();
+                            cfill.extend_from_slice(&ccnt[..np]);
+                            for c in cls.iter() {
+                                let f = cfill.get_unchecked_mut((c.0 >> 32) as usize);
+                                d.add(*f as usize).write(*c);
+                                *f += 1;
+                            }
+                        }
+                        let exotic_ck = cls.iter().any(|c| c.1 & EXOTIC != 0);
+                        // cgrp[x] = (start, len) of person x's clicks in cls2, sorted by (ts, click id), deduped
+                        cgrp.clear();
+                        cgrp.resize(np, (0, 0));
+                        for x in 0..np {
+                            let (a, b) = (ccnt[x] as usize, ccnt[x + 1] as usize);
+                            if a == b {
+                                continue;
+                            }
+                            let g = &mut cls2[a..b];
+                            if g.len() > 1 {
+                                if exotic_ck {
+                                    g.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| ckeys_k.cmp(a.1, b.1)));
+                                } else if g.len() <= 16 {
+                                    for u in 1..g.len() {
+                                        let v = g[u];
+                                        let mut w = u;
+                                        while w > 0 && (g[w - 1].0, g[w - 1].1) > (v.0, v.1) {
+                                            g[w] = g[w - 1];
+                                            w -= 1;
+                                        }
+                                        g[w] = v;
+                                    }
+                                } else {
+                                    g.sort_unstable_by_key(|c| ((c.0 as u128) << 64) | c.1 as u128);
+                                }
+                            }
+                            // drop repeats of the same click (same person, ts and id)
+                            let mut n = 1usize;
+                            for u in 1..g.len() {
+                                if g[u].0 != g[n - 1].0 || g[u].1 != g[n - 1].1 {
+                                    g[n] = g[u];
+                                    n += 1;
+                                }
+                            }
+                            cgrp[x] = (a as u32, n as u32);
+                        }
                         let t3 = unsafe { std::arch::x86_64::_rdtsc() };
                         tacc[0] += t1 - t0; tacc[1] += t2 - t1; tacc[2] += t3 - t2;
-                        let mut ci = 0usize;
                         let mut i = 0usize;
-                        while i < evs.len() {
-                            let idx = evs[i].0 >> 32;
-                            let person = pkeys[idx as usize];
-                            let mut j = i;
-                            while j < evs.len() && evs[j].0 >> 32 == idx {
-                                j += 1;
-                            }
-                            while ci < cls.len() && cls[ci].0 >> 32 < idx {
-                                ci += 1;
-                            }
-                            let c0 = ci;
-                            while ci < cls.len() && cls[ci].0 >> 32 == idx {
-                                ci += 1;
-                            }
-                            let pc = &cls[c0..ci];
+                        for idx in 0..pkeys.len() {
+                            let person = pkeys[idx];
+                            let j = pcnt[idx] as usize; // end of this person's events
+                            let (cs, cn) = cgrp[idx];
+                            let pc = &cls2[cs as usize..(cs + cn) as usize];
                             let cts = |x: &(u64, u64, u32)| ((x.0 as u32) ^ 0x8000_0000) as i32 as i64;
                             let (mut lo, mut hi) = (0usize, 0usize);
                             let mut k = i;
@@ -1210,7 +1240,7 @@ fn main() {
                             catsum.clear();
                             while k < j {
                                 let start = (evs[k].0 as u32) as i64;
-                                let day = ((ws + start).div_euclid(DAY) - first_day) as i32;
+                                let day = ((ws_in_day + start as u64) / DAY as u64) as i32;
                                 if day != cur_day {
                                     if cur_day != i32::MIN {
                                         o.rows.push(finish_row(&row, &mut catsum, cur_day, first_day));
@@ -1293,6 +1323,7 @@ fn main() {
                             active.clear();
                             i = j;
                         }
+                        pcnt.clear();
                     }
                     if std::env::var("TIMING").is_ok() {
                         let tot = unsafe { std::arch::x86_64::_rdtsc() } - tstart;
@@ -1444,27 +1475,36 @@ fn main() {
     unsafe { libc::_exit(0) };
 }
 
-/// Sorts up to 16 events of one person by ts (the low 32 bits of .0), branch-free:
-/// each event's rank is the number of smaller keys plus the equal ones before it.
+/// Sorts up to 32 events of one person by ts (the low 32 bits of .0) from src into dst,
+/// branch-free: each event's rank is the number of smaller keys plus the equal ones before it.
 #[inline(always)]
-unsafe fn rank_sort16(g: &mut [(u64, u32, u32)]) {
+unsafe fn rank_sort32_into(src: *const (u64, u32, u32), dst: *mut (u64, u32, u32), n: usize) {
     use std::arch::x86_64::*;
-    let n = g.len();
-    let mut ts = [u32::MAX; 16];
-    for i in 0..n {
-        ts[i] = g[i].0 as u32;
-    }
-    let mut tmp = [(0u64, 0u32, 0u32); 16];
+    let mut ts = [u32::MAX; 32];
     unsafe {
-        let v = _mm512_loadu_si512(ts.as_ptr() as *const _);
         for i in 0..n {
-            let b = _mm512_set1_epi32(ts[i] as i32);
-            let lt = _mm512_cmplt_epu32_mask(v, b) as u32;
-            let eq = _mm512_cmpeq_epi32_mask(v, b) as u32;
-            let r = lt.count_ones() + (eq & ((1u32 << i) - 1)).count_ones();
-            *tmp.get_unchecked_mut(r as usize) = *g.get_unchecked(i);
+            ts[i] = (*src.add(i)).0 as u32;
         }
-        std::ptr::copy_nonoverlapping(tmp.as_ptr(), g.as_mut_ptr(), n);
+        let v0 = _mm512_loadu_si512(ts.as_ptr() as *const _);
+        if n <= 16 {
+            for i in 0..n {
+                let b = _mm512_set1_epi32(ts[i] as i32);
+                let lt = _mm512_cmplt_epu32_mask(v0, b) as u32;
+                let eq = _mm512_cmpeq_epi32_mask(v0, b) as u32;
+                let r = lt.count_ones() + (eq & ((1u32 << i) - 1)).count_ones();
+                dst.add(r as usize).write(*src.add(i));
+            }
+        } else {
+            let v1 = _mm512_loadu_si512(ts.as_ptr().add(16) as *const _);
+            for i in 0..n {
+                let b = _mm512_set1_epi32(ts[i] as i32);
+                let lt = (_mm512_cmplt_epu32_mask(v0, b) as u32) | ((_mm512_cmplt_epu32_mask(v1, b) as u32) << 16);
+                let eq = (_mm512_cmpeq_epi32_mask(v0, b) as u32) | ((_mm512_cmpeq_epi32_mask(v1, b) as u32) << 16);
+                let below = ((1u64 << i) - 1) as u32;
+                let r = lt.count_ones() + (eq & below).count_ones();
+                dst.add(r as usize).write(*src.add(i));
+            }
+        }
     }
 }
 

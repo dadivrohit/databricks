@@ -230,23 +230,35 @@ fn eight(v: u64) -> u64 {
 }
 
 /// ASCII digits only (1+ of them) -> value; None on a non-digit or overflow of u64.
+/// Up to 16 digits take no loop (8 readable bytes past p + n are assumed for n <= 8).
 #[inline(always)]
 pub unsafe fn digits_u64(p: *const u8, n: usize) -> Option<u64> {
+    #[inline(always)]
+    unsafe fn upto8(p: *const u8, k: usize) -> Option<u64> {
+        // k in 1..=8 digits at p
+        let sh = 8 * (8 - k) as u32;
+        let raw = unsafe { ld64(p) } << sh; // digits in the high k bytes
+        let fill = if k == 8 { 0 } else { 0x3030_3030_3030_3030u64 >> (8 * k) };
+        let d = digits_of(raw | fill, u64::MAX)?;
+        Some(eight(d))
+    }
     if n == 0 {
         return None;
     }
     if n <= 8 {
-        let sh = 8 * (8 - n) as u32;
-        let raw = unsafe { ld64(p) } << sh; // digits in the high n bytes
-        let fill = if n == 8 { 0 } else { 0x3030_3030_3030_3030u64 >> (8 * n) };
-        let d = digits_of(raw | fill, u64::MAX)?;
-        return Some(eight(d));
+        return unsafe { upto8(p, n) };
     }
     if n <= 16 {
         let lo = digits_of(unsafe { ld64(p.add(n - 8)) }, u64::MAX)?;
-        let hi = unsafe { digits_u64(p, n - 8) }?;
+        let hi = unsafe { upto8(p, n - 8) }?;
         return Some(hi * 100_000_000 + eight(lo));
     }
+    unsafe { digits_long(p, n) }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn digits_long(p: *const u8, n: usize) -> Option<u64> {
     // long: leading zeros, or overflow
     let mut v: u64 = 0;
     for i in 0..n {
