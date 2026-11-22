@@ -6,7 +6,12 @@ pub struct LinkTable {
     pub names: &'static [AtomicU64], // !name of the person, at root slots
     pub parent: &'static [AtomicU32],
     pub mask: usize,
+    /// slots in all: probe runs go on past the hashed range instead of wrapping around
+    pub len: usize,
 }
+
+/// Room past the hashed range for probe runs (never wrapped, so a run is contiguous).
+const PAD: usize = 4096;
 
 /// Zeroed memory backed by huge pages where possible; never freed (the process ends with _exit).
 fn huge_zeroed(bytes: usize) -> *mut u8 {
@@ -37,20 +42,20 @@ pub fn mix(x: u64) -> u64 {
 impl LinkTable {
     pub fn new(cap_hint: usize) -> Self {
         let cap = cap_hint.next_power_of_two().max(1024);
+        let len = cap + PAD;
         let keys: &'static [AtomicU64] =
-            unsafe { std::slice::from_raw_parts(huge_zeroed(cap * 8) as *const AtomicU64, cap) };
+            unsafe { std::slice::from_raw_parts(huge_zeroed(len * 8) as *const AtomicU64, len) };
         let names: &'static [AtomicU64] =
-            unsafe { std::slice::from_raw_parts(huge_zeroed(cap * 8) as *const AtomicU64, cap) };
+            unsafe { std::slice::from_raw_parts(huge_zeroed(len * 8) as *const AtomicU64, len) };
         let parent: &'static [AtomicU32] =
-            unsafe { std::slice::from_raw_parts(huge_zeroed(cap * 4) as *const AtomicU32, cap) };
-        LinkTable { keys, names, parent, mask: cap - 1 }
+            unsafe { std::slice::from_raw_parts(huge_zeroed(len * 4) as *const AtomicU32, len) };
+        LinkTable { keys, names, parent, mask: cap - 1, len }
     }
 
     /// Slot of key, inserting it. Thread-safe.
     #[inline(always)]
     pub fn insert(&self, k: u64) -> u32 {
         let mut i = (mix(k) as usize) & self.mask;
-        let mut probes = 0;
         loop {
             let s = unsafe { self.keys.get_unchecked(i) };
             let cur = s.load(Relaxed);
@@ -66,9 +71,8 @@ impl LinkTable {
                     Err(_) => {}
                 }
             }
-            i = (i + 1) & self.mask;
-            probes += 1;
-            assert!(probes <= self.mask, "link table full");
+            i += 1;
+            assert!(i < self.len, "link table full");
         }
     }
 
@@ -109,7 +113,7 @@ impl LinkTable {
         }
     }
 
-    /// key -> root slot of its person, for linked keys (after `flatten`).
+    /// key -> root slot of its person, for linked keys (once every slot points at its root).
     #[inline(always)]
     pub fn get(&self, k: u64) -> Option<u32> {
         let mut i = (mix(k) as usize) & self.mask;
@@ -122,7 +126,16 @@ impl LinkTable {
             if cur == 0 {
                 return None;
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+        }
+    }
+
+    /// key -> person id (tag | root slot) for a linked key, else the key itself.
+    #[inline(always)]
+    pub fn person(&self, k: u64, tag: u64) -> u64 {
+        match self.get(k) {
+            Some(r) => tag | r as u64,
+            None => k,
         }
     }
 

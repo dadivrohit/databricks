@@ -216,6 +216,32 @@ impl Lookup {
             }
         }
     }
+    /// get() for a field inside a parse buffer (8 readable bytes after it): canonical
+    /// "<prefix>N" values decode without a loop, as their length varies line to line.
+    #[inline(always)]
+    unsafe fn get_at(&self, p: *const u8, n: usize) -> Option<u32> {
+        let pl = self.prefix.len();
+        if n > pl && n - pl <= 7 {
+            let k = n - pl;
+            let mut pre_ok = true;
+            for i in 0..pl {
+                pre_ok &= unsafe { *p.add(i) } == self.prefix[i];
+            }
+            let d = unsafe { p.add(pl) };
+            if pre_ok && unsafe { *d } != b'0' {
+                if let Some(v) = unsafe { fast::digits_u64(d, k) } {
+                    // v < 10^7 is never past 4M only for k <= 6; check the bound as get() does
+                    if v < 4_000_000 {
+                        return match self.arr.get(v as usize) {
+                            Some(&x) if x != 0 => Some(x - 1),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+        self.get(unsafe { std::slice::from_raw_parts(p, n) })
+    }
     #[inline(always)]
     fn get(&self, s: &[u8]) -> Option<u32> {
         if let Some(n) = canon_num(s, self.prefix) {
@@ -675,6 +701,8 @@ fn main() {
                     let mut sc = Scanner::new();
                     let mut rd = ChunkReader::new();
                     let mut kpairs: Vec<(u64, u64)> = Vec::new();
+                    let mut pacc = [0u64; 4];
+                    let pl0 = unsafe { std::arch::x86_64::_rdtsc() };
                     loop {
                         let i = next_link.fetch_add(1, Ordering::Relaxed);
                         if i >= nlink_chunks {
@@ -701,6 +729,7 @@ fn main() {
                         }
                         kpairs.clear();
                     }
+                    pacc[0] += unsafe { std::arch::x86_64::_rdtsc() } - pl0;
                     let _ = (barrier, exotic_slots, tid);
                     let mut arena = Arena::new(arena_cap);
                     let mut ev: WcParts<EventRec> = WcParts::new(NP);
@@ -710,6 +739,7 @@ fn main() {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(c) = chunks.get(i) else { break };
                         let m = &files[c.file as usize].0;
+                        let pc0 = unsafe { std::arch::x86_64::_rdtsc() };
                         let (data, cs, ce) = if m.map.is_null() {
                             let (cs, ce) = rd.load(m, c.start, c.end);
                             (rd.data(), cs, ce)
@@ -717,6 +747,9 @@ fn main() {
                             m.populate(c.start, c.end);
                             (m.bytes(), c.start, c.end)
                         };
+                        pacc[3] += unsafe { std::arch::x86_64::_rdtsc() } - pc0;
+                        let pc1 = unsafe { std::arch::x86_64::_rdtsc() };
+                        let kind = c.kind;
                         match c.kind {
                             2 => unreachable!(),
                             1 => {
@@ -729,7 +762,7 @@ fn main() {
                                         Some(t) if t >= ws - WEEK && t < we => t,
                                         _ => return,
                                     };
-                                    let Some(camp) = campaigns.get(std::slice::from_raw_parts(p.add(fa.0), fa.1 - fa.0))
+                                    let Some(camp) = campaigns.get_at(p.add(fa.0), fa.1 - fa.0)
                                     else {
                                         return;
                                     };
@@ -763,15 +796,12 @@ fn main() {
                                     let f4 = f[4];
                                     let n4 = f4.1 - f4.0;
                                     let tp = p.add(f4.0);
-                                    let mut purchase = false;
-                                    if n4 == 4 {
-                                        let w = ld32(tp);
-                                        valid &= w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart");
-                                    } else if n4 == 8 && ld64(tp) == u64::from_le_bytes(*b"purchase") {
-                                        purchase = true;
-                                    } else {
-                                        valid = false;
-                                    }
+                                    // branch-free: the type is random from line to line
+                                    let w4 = ld32(tp);
+                                    let w8 = ld64(tp);
+                                    let vc = (n4 == 4) & ((w4 == u32::from_le_bytes(*b"view")) | (w4 == u32::from_le_bytes(*b"cart")));
+                                    let purchase = (n4 == 8) & (w8 == u64::from_le_bytes(*b"purchase"));
+                                    valid &= vc | purchase;
                                     let f5 = f[5];
                                     valid &= f5.0 != f5.1;
                                     let mut price = 0u32;
@@ -781,9 +811,7 @@ fn main() {
                                         match fast::price(p.add(f6.0), f6.1 - f6.0) {
                                             Some(v) => {
                                                 price = v;
-                                                cat = products
-                                                    .get(std::slice::from_raw_parts(p.add(f5.0), f5.1 - f5.0))
-                                                    .unwrap_or(unknown_cat);
+                                                cat = products.get_at(p.add(f5.0), f5.1 - f5.0).unwrap_or(unknown_cat);
                                             }
                                             None => valid = false,
                                         }
@@ -793,8 +821,12 @@ fn main() {
                                 });
                             }
                         }
+                        pacc[if kind == 1 { 1 } else { 2 }] += unsafe { std::arch::x86_64::_rdtsc() } - pc1;
                     }
                     ev.finish(&mut arena);
+                    if std::env::var("TIMING").is_ok() {
+                        eprintln!("parse Mcyc: links {} clicks {} events {} read {}", pacc[0] / 1000000, pacc[1] / 1000000, pacc[2] / 1000000, pacc[3] / 1000000);
+                    }
                     Parsed { _arena: arena, ev: ev.parts, cl }
                 })
             })
@@ -807,7 +839,7 @@ fn main() {
         for tid in 0..nthreads {
             let (lt, barrier, exotic_slots, users) = (&lt, &barrier, &exotic_slots, &users);
             s.spawn(move || {
-                let cap = lt.mask + 1;
+                let cap = lt.len;
                 let (r0, r1) = (cap * tid / nthreads, cap * (tid + 1) / nthreads);
                 let mut exo = Vec::new();
                 for slot in r0..r1 {
@@ -886,81 +918,99 @@ fn main() {
                     let mut out: WcParts<PEv> = WcParts::new(NQ);
                     let mut outc: Parts<ClickRec> = Parts::new(NQ, fast::BLOCK_BYTES / std::mem::size_of::<ClickRec>());
                     let mut free: Vec<*mut u8> = Vec::new();
-                    let mut buf: Vec<EventRec> = Vec::new();
+                    let mut ptrs: Vec<*const EventRec> = Vec::new();
                     let mut table: Vec<u32> = Vec::new();
+                    let mut tkeys: Vec<u64> = Vec::new();
+                    let mut dacc = [0u64; 3];
                     let mut win: Vec<bool> = Vec::new();
-                    let mut surv: Vec<u32> = Vec::new();
+                    let mut surv: Vec<*const EventRec> = Vec::new();
                     loop {
                         let w = next.fetch_add(1, Ordering::Relaxed);
                         // event partitions first (they free blocks), then click pieces (which reuse them)
                         if w >= NP && w - NP < click_pieces.len() {
                             let (t, a, b) = click_pieces[w - NP];
+                            let c0 = unsafe { std::arch::x86_64::_rdtsc() };
                             for src in parsed[t].cl.slices(0).skip(a).take(b - a) {
                             for (i, c) in src.iter().enumerate() {
                                 if i + 32 < src.len() {
                                     lt.prefetch(src[i + 32].ukey);
                                 }
-                                let person = match lt.get(c.ukey) { Some(r) => LINKTAG | r as u64, None => c.ukey };
+                                let person = lt.person(c.ukey, LINKTAG);
                                 outc.push_r(&mut arena, &mut free, pbucket(person), ClickRec { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                             }
                             }
+                            dacc[2] += unsafe { std::arch::x86_64::_rdtsc() } - c0;
                             continue;
                         }
                         if w >= NP {
                             break;
                         }
                         let p = w;
-                        buf.clear();
+                        let q0 = unsafe { std::arch::x86_64::_rdtsc() };
+                        // index the partition's records in place (no copy)
+                        ptrs.clear();
                         for t in &parsed {
                             for sl in t.ev.slices(p) {
-                                buf.extend_from_slice(sl);
+                                ptrs.extend(sl.iter().map(|r| r as *const EventRec));
                             }
-                            free.extend(t.ev.block_ptrs(p).iter().map(|&b| b as *mut u8));
                         }
-                        let n = buf.len();
+                        let n = ptrs.len();
                         if n == 0 {
+                            for t in &parsed {
+                                free.extend(t.ev.block_ptrs(p).iter().map(|&b| b as *mut u8));
+                            }
                             continue;
                         }
                         let cap = (n * 2).next_power_of_two();
                         let mask = cap - 1;
+                        // keys in the table itself (0 = empty; event keys are never 0)
+                        tkeys.clear();
+                        tkeys.resize(cap, 0);
                         table.clear();
                         table.resize(cap, 0);
                         win.clear();
                         win.resize(n, false);
                         for i in 0..n {
-                            let r = unsafe { buf.get_unchecked(i) };
+                            let r = unsafe { &**ptrs.get_unchecked(i) };
                             let mut h = (mix(r.ekey) as usize) & mask;
                             loop {
-                                let slot = unsafe { table.get_unchecked_mut(h) };
-                                if *slot == 0 {
-                                    *slot = i as u32 + 1;
-                                    win[i] = true;
+                                let k = unsafe { *tkeys.get_unchecked(h) };
+                                if k == 0 {
+                                    unsafe {
+                                        *tkeys.get_unchecked_mut(h) = r.ekey;
+                                        *table.get_unchecked_mut(h) = i as u32;
+                                        *win.get_unchecked_mut(i) = true;
+                                    }
                                     break;
                                 }
-                                let j = (*slot - 1) as usize;
-                                if buf[j].ekey == r.ekey {
-                                    if r.ingest < buf[j].ingest {
-                                        win[j] = false;
-                                        win[i] = true;
-                                        *slot = i as u32 + 1;
+                                if k == r.ekey {
+                                    let j = unsafe { *table.get_unchecked(h) } as usize;
+                                    let rj = unsafe { &**ptrs.get_unchecked(j) };
+                                    if r.ingest < rj.ingest {
+                                        unsafe {
+                                            *win.get_unchecked_mut(j) = false;
+                                            *win.get_unchecked_mut(i) = true;
+                                            *table.get_unchecked_mut(h) = i as u32;
+                                        }
                                     }
                                     break;
                                 }
                                 h = (h + 1) & mask;
                             }
                         }
+                        let q1 = unsafe { std::arch::x86_64::_rdtsc() };
                         surv.clear();
                         for i in 0..n {
-                            if win[i] && buf[i].info >> 31 != 0 {
-                                surv.push(i as u32);
+                            if win[i] && unsafe { (**ptrs.get_unchecked(i)).info } >> 31 != 0 {
+                                surv.push(ptrs[i]);
                             }
                         }
-                        for (x, &i) in surv.iter().enumerate() {
+                        for (x, &rp) in surv.iter().enumerate() {
                             if x + 32 < surv.len() {
-                                lt.prefetch(buf[surv[x + 32] as usize].ukey);
+                                lt.prefetch(unsafe { (*surv[x + 32]).ukey });
                             }
-                            let r = &buf[i as usize];
-                            let person = match lt.get(r.ukey) { Some(rt) => LINKTAG | rt as u64, None => r.ukey };
+                            let r = unsafe { &*rp };
+                            let person = lt.person(r.ukey, LINKTAG);
                             out.push_r(
                                 &mut arena,
                                 &mut free,
@@ -968,8 +1018,18 @@ fn main() {
                                 PEv { person, ts: r.ts, pc: r.price | ((r.info & 0xFF) << 24) },
                             );
                         }
+                        let q2 = unsafe { std::arch::x86_64::_rdtsc() };
+                        dacc[0] += q1 - q0;
+                        dacc[1] += q2 - q1;
+                        // the partition's blocks are free once its survivors are routed
+                        for t in &parsed {
+                            free.extend(t.ev.block_ptrs(p).iter().map(|&b| b as *mut u8));
+                        }
                     }
                     out.finish(&mut arena);
+                    if std::env::var("TIMING").is_ok() {
+                        eprintln!("dedup Mcyc: table {} route {} clicks {}", dacc[0] / 1000000, dacc[1] / 1000000, dacc[2] / 1000000);
+                    }
                     Routed { _arena: arena, ev: out.parts, cl: outc }
                 })
             })
@@ -987,7 +1047,7 @@ fn main() {
     let next = AtomicUsize::new(0);
     struct Out {
         rows: Vec<UserRow>,
-        camp: Vec<[i64; 3]>, // [day * ncols + campaign]: sessions, purchasing, revenue
+        camp: Vec<(u32, u32, i64)>, // [day * ncols + campaign]: sessions, purchasing, revenue
         assist: Vec<u32>,    // [day * ncols + campaign]
     }
     let ncols = ncamp + 1; // last = organic
@@ -995,7 +1055,7 @@ fn main() {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
                 s.spawn(|| {
-                    let mut o = Out { rows: Vec::new(), camp: vec![[0; 3]; ncols * ndays], assist: vec![0; ncols * ndays] };
+                    let mut o = Out { rows: Vec::new(), camp: vec![(0, 0, 0); ncols * ndays], assist: vec![0; ncols * ndays] };
                     let mut evs: Vec<(u64, u32, u32)> = Vec::new(); // (idx<<32|ts, price, cat)
                     let mut evs2: Vec<(u64, u32, u32)> = Vec::new();
                     let mut tacc = [0u64; 4];
@@ -1067,10 +1127,15 @@ fn main() {
                                 }
                             }
                             std::mem::swap(&mut evs, &mut evs2);
+                            tacc[3] += unsafe { std::arch::x86_64::_rdtsc() } - t1;
                             let mut s0 = 0usize;
                             for &end in pcnt.iter() {
                                 let g = &mut evs[s0..end as usize];
-                                if g.len() <= 24 {
+                                if g.len() <= 16 {
+                                    if g.len() > 1 {
+                                        unsafe { rank_sort16(g) };
+                                    }
+                                } else if g.len() <= 24 {
                                     for a in 1..g.len() {
                                         let x = g[a];
                                         let mut b = a;
@@ -1110,7 +1175,13 @@ fn main() {
                                 }
                             }
                         }
-                        cls.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| ckeys_k.cmp(a.1, b.1)));
+                        let exotic_ck = cls.iter().any(|c| c.1 & EXOTIC != 0);
+                        if exotic_ck {
+                            cls.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| ckeys_k.cmp(a.1, b.1)));
+                        } else {
+                            // short click keys compare as numbers: (idx<<32|ts, ckey) is the order
+                            cls.sort_unstable_by_key(|c| ((c.0 as u128) << 64) | c.1 as u128);
+                        }
                         cls.dedup_by(|b, a| a.0 == b.0 && a.1 == b.1);
                         let t3 = unsafe { std::arch::x86_64::_rdtsc() };
                         tacc[0] += t1 - t0; tacc[1] += t2 - t1; tacc[2] += t3 - t2;
@@ -1203,10 +1274,10 @@ fn main() {
                                 } else {
                                     ncamp
                                 };
-                                let cell = &mut o.camp[dayu * ncols + credited];
-                                cell[0] += 1;
-                                cell[1] += purchases as i64;
-                                cell[2] += rev;
+                                let cell = unsafe { o.camp.get_unchecked_mut(dayu * ncols + credited) };
+                                cell.0 += 1;
+                                cell.1 += purchases as u32;
+                                cell.2 += rev;
                                 let arow = &mut o.assist[dayu * ncols..(dayu + 1) * ncols];
                                 for &a in &active {
                                     unsafe { *arow.get_unchecked_mut(a as usize) += 1 };
@@ -1225,7 +1296,7 @@ fn main() {
                     }
                     if std::env::var("TIMING").is_ok() {
                         let tot = unsafe { std::arch::x86_64::_rdtsc() } - tstart;
-                        eprintln!("sess Mcyc: gather {} group {} clicks {} rest {}", tacc[0] / 1000000, tacc[1] / 1000000, tacc[2] / 1000000, (tot - tacc[0] - tacc[1] - tacc[2]) / 1000000);
+                        eprintln!("sess Mcyc: gather {} group {} (scatter {}) clicks {} rest {}", tacc[0] / 1000000, tacc[1] / 1000000, tacc[3] / 1000000, tacc[2] / 1000000, (tot - tacc[0] - tacc[1] - tacc[2]) / 1000000);
                     }
                     o
                 })
@@ -1318,9 +1389,9 @@ fn main() {
                 for c in 0..ncols {
                     let b = o.camp[d * ncols + c];
                     let a = &mut agg[c * ndays + d];
-                    a[0] += b[0];
-                    a[1] += b[1];
-                    a[2] += b[2];
+                    a[0] += b.0 as i64;
+                    a[1] += b.1 as i64;
+                    a[2] += b.2;
                     a[3] += o.assist[d * ncols + c] as i64;
                 }
             }
@@ -1371,6 +1442,30 @@ fn main() {
         unsafe { __llvm_profile_write_file() };
     }
     unsafe { libc::_exit(0) };
+}
+
+/// Sorts up to 16 events of one person by ts (the low 32 bits of .0), branch-free:
+/// each event's rank is the number of smaller keys plus the equal ones before it.
+#[inline(always)]
+unsafe fn rank_sort16(g: &mut [(u64, u32, u32)]) {
+    use std::arch::x86_64::*;
+    let n = g.len();
+    let mut ts = [u32::MAX; 16];
+    for i in 0..n {
+        ts[i] = g[i].0 as u32;
+    }
+    let mut tmp = [(0u64, 0u32, 0u32); 16];
+    unsafe {
+        let v = _mm512_loadu_si512(ts.as_ptr() as *const _);
+        for i in 0..n {
+            let b = _mm512_set1_epi32(ts[i] as i32);
+            let lt = _mm512_cmplt_epu32_mask(v, b) as u32;
+            let eq = _mm512_cmpeq_epi32_mask(v, b) as u32;
+            let r = lt.count_ones() + (eq & ((1u32 << i) - 1)).count_ones();
+            *tmp.get_unchecked_mut(r as usize) = *g.get_unchecked(i);
+        }
+        std::ptr::copy_nonoverlapping(tmp.as_ptr(), g.as_mut_ptr(), n);
+    }
 }
 
 fn finish_row(row: &UserRow, catsum: &mut Vec<(u32, i64)>, day: i32, first_day: i64) -> UserRow {

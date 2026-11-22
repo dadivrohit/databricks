@@ -59,7 +59,7 @@ pub unsafe fn fields<const N: usize>(p: *const u8, len: usize, cm: u128, qm: u12
         s = c + 1;
     }
     f[N - 1] = (s, len);
-    if qm != 0 {
+    {
         // Quotes may only wrap whole fields. Field starts FS, terminators FE (commas + line end),
         // last chars FL. For each quote at a field start, FE & !(FE - QS) is that field's
         // terminator; its last char must hold the matching quote.
@@ -726,6 +726,19 @@ impl<T: Copy> Parts<T> {
 #[derive(Clone, Copy)]
 pub struct Line([u8; 64]);
 
+/// Branch-free pushes for the parse scatter (env BLWC; off by default).
+static BLWC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+#[inline(always)]
+fn wc_branchless() -> bool {
+    let v = BLWC.load(std::sync::atomic::Ordering::Relaxed);
+    if v != 2 {
+        return v == 1;
+    }
+    let r = std::env::var_os("BLWC").is_some();
+    BLWC.store(r as u8, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 pub struct WcParts<T: Copy> {
     pub parts: Parts<T>,
     stage: Vec<Line>,
@@ -744,8 +757,33 @@ impl<T: Copy> WcParts<T> {
             fill: vec![0; n],
         }
     }
+    /// Branch-free push: streams the (possibly partial) staging line on every push and only
+    /// moves the head once the line is full; a partial line is rewritten by the next push.
+    /// (Which partitions fill up next is random, so a branch on it mispredicts often.)
+    #[inline(always)]
+    fn push_bl<const R: bool>(&mut self, arena: &mut Arena, free: &mut Vec<*mut u8>, h: usize, v: T) {
+        unsafe {
+            let f = *self.fill.get_unchecked(h) as usize;
+            let line = self.stage.get_unchecked_mut(h);
+            (line.0.as_mut_ptr() as *mut T).add(f).write(v);
+            let p = &mut self.parts;
+            let mut hp = *p.head.get_unchecked(h);
+            if hp == *p.end.get_unchecked(h) {
+                hp = if R { p.grow_r(arena, free, h) } else { p.grow(arena, h) };
+            }
+            let v512 = _mm512_load_si512(line.0.as_ptr() as *const _);
+            _mm512_stream_si512(hp as *mut _, v512);
+            let full = (f + 1 == Self::K) as usize;
+            *self.fill.get_unchecked_mut(h) = ((f + 1) * (1 - full)) as u8;
+            *p.head.get_unchecked_mut(h) = hp.add(Self::K * full);
+        }
+    }
     #[inline(always)]
     pub fn push(&mut self, arena: &mut Arena, h: usize, v: T) {
+        if wc_branchless() {
+            let mut none = Vec::new();
+            return self.push_bl::<false>(arena, &mut none, h, v);
+        }
         unsafe {
             let f = *self.fill.get_unchecked(h) as usize;
             let line = self.stage.get_unchecked_mut(h);
